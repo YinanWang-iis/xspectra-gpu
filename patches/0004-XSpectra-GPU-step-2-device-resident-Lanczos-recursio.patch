@@ -1,0 +1,817 @@
+From 4ae25d92e7aac4d32b9a5b3a1005e6d98678a81b Mon Sep 17 00:00:00 2001
+From: ynwang <ynwang@iis.u-tokyo.ac.jp>
+Date: Wed, 11 Nov 2026 14:02:39 +0900
+Subject: [PATCH 4/9] XSpectra GPU step 2: device-resident Lanczos recursion
+ and S^-1
+
+- lanczos_acc.f90 (GPU build only): lanczos_acc / lanczos_uspp_acc keep
+  the Lanczos vectors on the device for the whole recursion; h_psi, S^-1
+  and the axpy/scal/dot operations run there, only a(i), b(i) return to
+  the host (convergence test unchanged). Same recursion and order of
+  operations as the host routines.
+- lr_sm1_psi.f90: the k-point BB_ matrix moves from a SAVEd local of
+  sm1_psi_k into module xs_sm1_data (built by sm1_build_bb_k, code moved
+  verbatim, host arithmetic unchanged); new sm1_psi_acc applies S^-1 on
+  the device with cuBLAS (MYZGEMM), mirroring BB_ when it is rebuilt.
+- lanczos.f90: in the GPU build lanczos/lanczos_uspp dispatch to the
+  device versions; the host code is otherwise the original (replaces the
+  step-1 host/device copies around h_psi).
+Small SiO2 test (9 at., 8 k): a,b agree with CPU to <=3.2e-12 over the
+first 50 iterations.
+---
+ XSpectra/CMakeLists.txt      |   1 +
+ XSpectra/src/lanczos.f90     |  62 ++-----
+ XSpectra/src/lanczos_acc.f90 | 338 +++++++++++++++++++++++++++++++++++
+ XSpectra/src/lr_sm1_psi.f90  | 253 +++++++++++++++++++-------
+ 4 files changed, 537 insertions(+), 117 deletions(-)
+ create mode 100644 XSpectra/src/lanczos_acc.f90
+
+diff --git a/XSpectra/CMakeLists.txt b/XSpectra/CMakeLists.txt
+index 010a8e920..42f999002 100644
+--- a/XSpectra/CMakeLists.txt
++++ b/XSpectra/CMakeLists.txt
+@@ -10,6 +10,7 @@ set(src_xspectra
+     src/reset_k_points_and_reinit.f90
+     src/select_nl_init.f90
+     src/lanczos.f90
++    src/lanczos_acc.f90
+     src/plot_xanes_cross_sections.f90
+     src/xanes_dipole_general_edge.f90
+     src/banner_xspectra.f90
+diff --git a/XSpectra/src/lanczos.f90 b/XSpectra/src/lanczos.f90
+index 0708b47bf..a214dc4b9 100644
+--- a/XSpectra/src/lanczos.f90
++++ b/XSpectra/src/lanczos.f90
+@@ -44,6 +44,12 @@ SUBROUTINE lanczos (a,b,npw,psi,ncalcv,terminator)
+   EXTERNAL :: h_psi
+ 
+ 
++#if defined(__CUDA)
++  ! GPU build: device-resident recursion (lanczos_acc.f90)
++  CALL lanczos_acc(a,b,npw,psi,ncalcv,terminator)
++  RETURN
++#endif
++
+   ALLOCATE(hpsi(npwx))
+   ALLOCATE(u(npwx))
+   ALLOCATE(comp(xnepoint))
+@@ -59,21 +65,11 @@ SUBROUTINE lanczos (a,b,npw,psi,ncalcv,terminator)
+ 
+   iconv=.false.
+ 
+-#if defined(__CUDA)
+-  ! GPU build: h_psi works on device-resident arrays (present/host_data).
+-  ! becp is allocated on the host by the caller -> mirror it on the device.
+-  CALL xs_check_gpu_support()
+-  !$acc enter data copyin(becp)
+-  !$acc enter data copyin(becp%k)
+-  !$acc data create(psi, hpsi, u)
+-#endif
+   ! ------------------------  1st iteration --------------------------
+   !
+   ! -- computes H*Psi  (|u0>=|Psi>)
+ 
+-  !$acc update device(psi)
+   CALL h_psi( npwx, npw,1, psi, hpsi )
+-  !$acc update self(hpsi)
+ 
+ 
+   ! -- computes a_(1)=<Psi|HPsi>
+@@ -126,9 +122,7 @@ SUBROUTINE lanczos (a,b,npw,psi,ncalcv,terminator)
+      !   hpsi=empty
+      !   psi=psi_j-1
+ 
+-     !$acc update device(u)
+      CALL h_psi( npwx, npw, 1, u, hpsi )
+-     !$acc update self(hpsi)
+ 
+ 
+      !
+@@ -192,12 +186,6 @@ SUBROUTINE lanczos (a,b,npw,psi,ncalcv,terminator)
+ 
+   ENDDO
+ 
+-#if defined(__CUDA)
+-  !$acc end data
+-  !$acc exit data delete(becp%k)
+-  !$acc exit data delete(becp)
+-#endif
+-
+   IF(.NOT.iconv) THEN
+      ldummy=converge(a,b,i-1,comp,error,xemin_ry,xemax_ry,&
+                    xgamma_ry,xnepoint,xerror,terminator) 
+@@ -260,6 +248,12 @@ SUBROUTINE lanczos_uspp (a,b,npw,psi,ncalcv,terminator)
+   REAL(dp), EXTERNAL :: ddot
+   EXTERNAL :: h_psi
+ 
++#if defined(__CUDA)
++  ! GPU build: device-resident recursion (lanczos_acc.f90)
++  CALL lanczos_uspp_acc(a,b,npw,psi,ncalcv,terminator)
++  RETURN
++#endif
++
+   ALLOCATE(v1(npwx))
+   ALLOCATE(u(npwx))
+   ALLOCATE(comp(xnepoint))
+@@ -278,21 +272,11 @@ SUBROUTINE lanczos_uspp (a,b,npw,psi,ncalcv,terminator)
+ 
+   iconv=.false.
+ 
+-#if defined(__CUDA)
+-  ! GPU build: h_psi works on device-resident arrays (present/host_data).
+-  ! becp is allocated on the host by the caller -> mirror it on the device.
+-  CALL xs_check_gpu_support()
+-  !$acc enter data copyin(becp)
+-  !$acc enter data copyin(becp%k)
+-  !$acc data create(v1, v2, u)
+-#endif
+   ! ------------------------  1st iteration --------------------------
+   !
+   recalc=.true.
+   CALL sm1_psi(recalc,npwx, npw, 1, psi, v1) ! -- computes v1= S^-1 psi
+-  !$acc update device(v1)
+   CALL h_psi( npwx, npw,1, v1, u )           ! -- computes u = H v1
+-  !$acc update self(u)
+ 
+   ! -- computes a_(1)=<v1|u>
+ 
+@@ -324,9 +308,7 @@ SUBROUTINE lanczos_uspp (a,b,npw,psi,ncalcv,terminator)
+ 
+   DO i=2,xniter
+ 
+-     !$acc update device(v1)
+      CALL h_psi( npwx, npw,1, v1,v2)         ! -- computes v2= H v1
+-     !$acc update self(v2)
+ 
+      a(i)=ddot(2*npw,v1,1,v2,1)              ! -- computes a_i=<v1|v2>
+      CALL mp_sum( a(i), intra_pool_comm )
+@@ -375,12 +357,6 @@ SUBROUTINE lanczos_uspp (a,b,npw,psi,ncalcv,terminator)
+ 
+   ENDDO
+ 
+-#if defined(__CUDA)
+-  !$acc end data
+-  !$acc exit data delete(becp%k)
+-  !$acc exit data delete(becp)
+-#endif
+-
+   IF(.NOT.iconv) THEN
+      WRITE(stdout,'(8x,a,i6,a)') '!   XANES not converged after', i-1,&
+                                  ' iterations'
+@@ -398,20 +374,6 @@ END SUBROUTINE lanczos_uspp
+ 
+ !</CG>
+ 
+-!------------------------------------------------------------------------------
+-SUBROUTINE xs_check_gpu_support()
+-  !----------------------------------------------------------------------------
+-  ! GPU build only: the device path of lanczos/lanczos_uspp assumes a
+-  ! collinear k-point calculation (becp%k, one npwx-long vector).
+-  USE control_flags,    ONLY : gamma_only
+-  USE noncollin_module, ONLY : noncolin
+-  IMPLICIT NONE
+-  IF (gamma_only) CALL errore('xspectra', &
+-       'gamma_only is not supported by the GPU version of XSpectra', 1)
+-  IF (noncolin) CALL errore('xspectra', &
+-       'noncollinear calculations are not supported by the GPU version of XSpectra', 1)
+-END SUBROUTINE xs_check_gpu_support
+-
+ !------------------------------------------------------------------------------
+ !------------------------------------------------------------------------------
+ LOGICAL FUNCTION converge(a,b,m,comp,estimated_error,xemin,xemax,xgamma,&
+diff --git a/XSpectra/src/lanczos_acc.f90 b/XSpectra/src/lanczos_acc.f90
+new file mode 100644
+index 000000000..7d7b8c120
+--- /dev/null
++++ b/XSpectra/src/lanczos_acc.f90
+@@ -0,0 +1,338 @@
++!
++! Copyright (C) 2026 Quantum ESPRESSO group
++! This file is distributed under the terms of the
++! GNU General Public License. See the file `License'
++! in the root directory of the present distribution,
++! or http://www.gnu.org/copyleft/gpl.txt .
++!
++!------------------------------------------------------------------------------
++! GPU (OpenACC) versions of lanczos and lanczos_uspp (lanczos.f90).
++! The Lanczos vectors stay on the device for the whole recursion; h_psi,
++! S^-1 (sm1_psi_acc) and the vector algebra run there, and only the scalars
++! a(i), b(i) come back to the host, where the convergence test (converge /
++! continued_fraction) is unchanged. Same recursion, same order of operations
++! as the host routines; only the summation order of the dot products differs.
++! Compiled only in the GPU build; lanczos/lanczos_uspp dispatch here.
++!------------------------------------------------------------------------------
++#if defined(__CUDA)
++!------------------------------------------------------------------------------
++SUBROUTINE xs_check_gpu_support()
++  !----------------------------------------------------------------------------
++  !! The device path assumes a collinear k-point calculation (becp%k, one
++  !! npwx-long vector): stop explicitly otherwise.
++  USE control_flags,    ONLY : gamma_only
++  USE noncollin_module, ONLY : noncolin
++  IMPLICIT NONE
++  IF (gamma_only) CALL errore('xspectra', &
++       'gamma_only is not supported by the GPU version of XSpectra', 1)
++  IF (noncolin) CALL errore('xspectra', &
++       'noncollinear calculations are not supported by the GPU version of XSpectra', 1)
++END SUBROUTINE xs_check_gpu_support
++!
++!------------------------------------------------------------------------------
++FUNCTION xs_rdot_acc( n, x, y ) RESULT( s )
++  !----------------------------------------------------------------------------
++  !! Re <x|y> over the first n components (= ddot(2n,x,1,y,1)); x, y on device
++  USE kinds, ONLY : DP
++  IMPLICIT NONE
++  INTEGER,     INTENT(IN) :: n
++  COMPLEX(DP), INTENT(IN) :: x(n), y(n)
++  REAL(DP) :: s
++  INTEGER  :: j
++  s = 0.0_DP
++  !$acc parallel loop reduction(+:s) present(x, y)
++  DO j = 1, n
++     s = s + DBLE(x(j))*DBLE(y(j)) + AIMAG(x(j))*AIMAG(y(j))
++  END DO
++END FUNCTION xs_rdot_acc
++!
++!------------------------------------------------------------------------------
++SUBROUTINE lanczos_uspp_acc( a, b, npw, psi, ncalcv, terminator )
++  !----------------------------------------------------------------------------
++  USE kinds,     ONLY: DP
++  USE wvfct,     ONLY: npwx
++  USE becmod,    ONLY: becp
++  USE constants, ONLY: rytoev
++  USE xspectra,  ONLY: xniter, xnepoint, xcheck_conv, xnitermax, &
++                       xemin, xemax, xgamma, xerror
++  USE mp_pools,  ONLY: intra_pool_comm
++  USE mp,        ONLY: mp_sum
++  USE io_global, ONLY: stdout
++  !
++  IMPLICIT NONE
++  !
++  REAL(dp),    INTENT(INOUT) :: a(xnitermax), b(xnitermax)
++  COMPLEX(dp), INTENT(INOUT) :: psi(npwx)
++  INTEGER,     INTENT(INOUT) :: ncalcv
++  INTEGER,     INTENT(IN)    :: npw
++  LOGICAL,     INTENT(IN)    :: terminator
++  !
++  LOGICAL  :: converge, iconv, recalc
++  INTEGER  :: i, j
++  REAL(dp) :: error, xemin_ry, xemax_ry, xgamma_ry, ai, bim1, rb
++  REAL(dp), ALLOCATABLE :: comp(:)
++  COMPLEX(dp), ALLOCATABLE :: u(:), v1(:), v2(:)
++  REAL(dp), EXTERNAL :: xs_rdot_acc
++  EXTERNAL :: h_psi
++  !
++  ALLOCATE( v1(npwx), v2(npwx), u(npwx), comp(xnepoint) )
++  a(:) = 0.d0
++  b(:) = 0.d0
++  xemax_ry  = xemax/rytoev
++  xemin_ry  = xemin/rytoev
++  xgamma_ry = xgamma/rytoev
++  iconv = .false.
++  !
++  CALL xs_check_gpu_support()
++  ! becp is allocated on the host by the caller: mirror it on the device
++  !$acc enter data copyin(becp)
++  !$acc enter data copyin(becp%k)
++  !$acc data copy(psi) create(u, v1, v2)
++  !
++  !$acc parallel loop present(u, v1, v2)
++  DO j = 1, npwx
++     u(j)  = (0.d0,0.d0)
++     v1(j) = (0.d0,0.d0)
++     v2(j) = (0.d0,0.d0)
++  END DO
++  !
++  ! ------------------------  1st iteration --------------------------
++  !
++  recalc = .true.
++  CALL sm1_psi_acc( recalc, npwx, npw, 1, psi, v1 )  ! v1 = S^-1 psi
++  CALL h_psi( npwx, npw, 1, v1, u )                  ! u  = H v1
++  !
++  a(1) = xs_rdot_acc( npw, v1, u )                   ! a_1 = <v1|u>
++  CALL mp_sum( a(1), intra_pool_comm )
++  ai = a(1)
++  !$acc parallel loop present(u, psi)
++  DO j = 1, npw
++     u(j) = u(j) - ai*psi(j)                         ! u = u - a_1 psi
++  END DO
++  recalc = .false.
++  CALL sm1_psi_acc( recalc, npwx, npw, 1, u, v1 )    ! v1 = S^-1 u
++  !
++  b(1) = xs_rdot_acc( npw, u, v1 )                   ! b_1 = sqrt(<u|v1>)
++  CALL mp_sum( b(1), intra_pool_comm )
++  b(1) = SQRT( b(1) )
++  rb = 1.d0/b(1)
++  !$acc parallel loop present(u, v1)
++  DO j = 1, npw
++     u(j)  = u(j)*rb
++     v1(j) = v1(j)*rb
++  END DO
++  !
++  ! -------------------------- Next iterations -----------------------
++  !
++  comp(:) = 0.d0
++  comp(1) = 1.d0
++  !
++  DO i = 2, xniter
++     !
++     CALL h_psi( npwx, npw, 1, v1, v2 )              ! v2 = H v1
++     !
++     a(i) = xs_rdot_acc( npw, v1, v2 )               ! a_i = <v1|v2>
++     CALL mp_sum( a(i), intra_pool_comm )
++     !
++     ai = a(i)
++     bim1 = b(i-1)
++     !$acc parallel loop present(v2, psi, u)
++     DO j = 1, npw
++        v2(j) = v2(j) - bim1*psi(j)                  ! v2 = v2 - b_{i-1} psi
++        v2(j) = v2(j) - ai*u(j)                      ! v2 = v2 - a_i u
++     END DO
++     !
++     !$acc parallel loop present(v1)
++     DO j = 1, npwx
++        v1(j) = (0.d0,0.d0)
++     END DO
++     recalc = .false.
++     CALL sm1_psi_acc( recalc, npwx, npw, 1, v2, v1 ) ! v1 = S^-1 v2
++     !
++     b(i) = xs_rdot_acc( npw, v2, v1 )               ! b_i = sqrt(<v2|v1>)
++     CALL mp_sum( b(i), intra_pool_comm )
++     b(i) = SQRT( b(i) )
++     !
++     rb = 1.d0/b(i)
++     !$acc parallel loop present(psi, u, v1, v2)
++     DO j = 1, npwx
++        psi(j) = u(j)                                ! psi <- u
++        IF (j <= npw) THEN
++           v2(j) = v2(j)*rb                          ! v2 = v2/b_i
++           v1(j) = v1(j)*rb                          ! v1 = v1/b_i
++        END IF
++        u(j) = v2(j)                                 ! u <- v2
++     END DO
++     !
++     IF (MOD(i,xcheck_conv) == 0) THEN
++        IF (converge(a, b, i, comp, error, xemin_ry, xemax_ry, &
++                     xgamma_ry, xnepoint, xerror, terminator)) THEN
++           WRITE(stdout,'(8x,a,i6,a,f12.8)') '!   => CONVERGED at iter ',i,&
++                                             ' with error=',error
++           ncalcv = i
++           iconv = .true.
++           EXIT
++        ELSE
++           WRITE(stdout,'(8x,a,i6,a,f12.8)') '|   Estimated error at iter ',i,&
++                                             ': ', error
++        ENDIF
++     ENDIF
++     !
++  ENDDO
++  !
++  !$acc end data
++  !$acc exit data delete(becp%k)
++  !$acc exit data delete(becp)
++  !
++  IF (.NOT.iconv) THEN
++     WRITE(stdout,'(8x,a,i6,a)') '!   XANES not converged after', i-1,&
++                                 ' iterations'
++     WRITE(stdout,'(8x,a,i6,a,l1)') '!   Estimated final error after ',&
++          i-1,'iterations: ', &
++          converge(a,b,i-1,comp,error,xemin_ry,xemax_ry,&
++                   xgamma_ry,xnepoint,xerror,terminator)
++     ncalcv = i-1
++  ENDIF
++  !
++  DEALLOCATE( v1, v2, u, comp )
++  !
++END SUBROUTINE lanczos_uspp_acc
++!
++!------------------------------------------------------------------------------
++SUBROUTINE lanczos_acc( a, b, npw, psi, ncalcv, terminator )
++  !----------------------------------------------------------------------------
++  !! norm-conserving case (S = 1)
++  USE kinds,     ONLY: DP
++  USE wvfct,     ONLY: npwx
++  USE becmod,    ONLY: becp
++  USE constants, ONLY: rytoev
++  USE xspectra,  ONLY: xniter, xnepoint, xcheck_conv, xnitermax, &
++                       xemin, xemax, xgamma, xerror
++  USE mp_pools,  ONLY: intra_pool_comm
++  USE mp,        ONLY: mp_sum
++  USE io_global, ONLY: stdout
++  !
++  IMPLICIT NONE
++  !
++  REAL(dp),    INTENT(INOUT) :: a(xnitermax), b(xnitermax)
++  COMPLEX(dp), INTENT(INOUT) :: psi(npwx)
++  INTEGER,     INTENT(INOUT) :: ncalcv
++  INTEGER,     INTENT(IN)    :: npw
++  LOGICAL,     INTENT(IN)    :: terminator
++  !
++  LOGICAL  :: converge, iconv, ldummy
++  INTEGER  :: i, j
++  REAL(dp) :: error, xemin_ry, xemax_ry, xgamma_ry, ai, bim1, rb
++  REAL(dp), ALLOCATABLE :: comp(:)
++  COMPLEX(dp), ALLOCATABLE :: hpsi(:), u(:)
++  REAL(dp), EXTERNAL :: xs_rdot_acc
++  EXTERNAL :: h_psi
++  !
++  ALLOCATE( hpsi(npwx), u(npwx), comp(xnepoint) )
++  a(:) = 0.d0
++  b(:) = 0.d0
++  xemax_ry  = xemax/rytoev
++  xemin_ry  = xemin/rytoev
++  xgamma_ry = xgamma/rytoev
++  iconv = .false.
++  !
++  CALL xs_check_gpu_support()
++  !$acc enter data copyin(becp)
++  !$acc enter data copyin(becp%k)
++  !$acc data copy(psi) create(hpsi, u)
++  !
++  !$acc parallel loop present(hpsi, u)
++  DO j = 1, npwx
++     hpsi(j) = (0.d0,0.d0)
++     u(j)    = (0.d0,0.d0)
++  END DO
++  !
++  ! ------------------------  1st iteration --------------------------
++  !
++  CALL h_psi( npwx, npw, 1, psi, hpsi )              ! hpsi = H psi
++  a(1) = xs_rdot_acc( npw, psi, hpsi )               ! a_1 = <psi|H psi>
++  CALL mp_sum( a(1), intra_pool_comm )
++  ai = a(1)
++  !$acc parallel loop present(hpsi, psi)
++  DO j = 1, npw
++     hpsi(j) = hpsi(j) - ai*psi(j)
++  END DO
++  b(1) = xs_rdot_acc( npw, hpsi, hpsi )
++  CALL mp_sum( b(1), intra_pool_comm )
++  b(1) = SQRT( b(1) )
++  rb = 1.d0/b(1)
++  !$acc parallel loop present(hpsi, u)
++  DO j = 1, npwx
++     IF (j <= npw) THEN
++        hpsi(j) = hpsi(j)*rb
++        u(j) = hpsi(j)                               ! |u1>
++     END IF
++     hpsi(j) = (0.d0,0.d0)
++  END DO
++  !
++  ! -------------------------- Next iterations -----------------------
++  !
++  comp(:) = 0.d0
++  comp(1) = 1.d0
++  !
++  DO i = 2, xniter
++     !   u = psi_j, hpsi = empty, psi = psi_j-1
++     CALL h_psi( npwx, npw, 1, u, hpsi )
++     !
++     bim1 = b(i-1)
++     !$acc parallel loop present(hpsi, psi)
++     DO j = 1, npw
++        hpsi(j) = hpsi(j) - bim1*psi(j)
++     END DO
++     a(i) = xs_rdot_acc( npw, hpsi, u )
++     CALL mp_sum( a(i), intra_pool_comm )
++     ai = a(i)
++     !$acc parallel loop present(hpsi, u)
++     DO j = 1, npw
++        hpsi(j) = hpsi(j) - ai*u(j)
++     END DO
++     b(i) = xs_rdot_acc( npw, hpsi, hpsi )
++     CALL mp_sum( b(i), intra_pool_comm )
++     b(i) = SQRT( b(i) )
++     rb = 1.d0/b(i)
++     !$acc parallel loop present(psi, u, hpsi)
++     DO j = 1, npw
++        psi(j)  = u(j)
++        u(j)    = hpsi(j)*rb
++        hpsi(j) = (0.d0,0.d0)
++     END DO
++     !
++     IF (MOD(i,xcheck_conv) == 0) THEN
++        IF (converge(a, b, i, comp, error, xemin_ry, xemax_ry, &
++                     xgamma_ry, xnepoint, xerror, terminator)) THEN
++           WRITE(stdout,'(8x,a,i6,a,f12.8)') '!   => CONVERGED at iter ',i,&
++                                             ' with error=',error
++           ncalcv = i
++           iconv = .true.
++           EXIT
++        ELSE
++           WRITE(stdout,'(8x,a,i6,a,f12.8)') '|   Estimated error at iter ',i,&
++                                             ': ', error
++        ENDIF
++     ENDIF
++     !
++  ENDDO
++  !
++  !$acc end data
++  !$acc exit data delete(becp%k)
++  !$acc exit data delete(becp)
++  !
++  IF (.NOT.iconv) THEN
++     ldummy = converge(a,b,i-1,comp,error,xemin_ry,xemax_ry,&
++                       xgamma_ry,xnepoint,xerror,terminator)
++     WRITE(stdout,'(8x,a,i6,a)') '!   XANES not converged after', i-1,&
++                                 ' iterations'
++     WRITE(stdout,'(8x,a,i6,a,f12.8)') '!   Estimated final error after ',&
++          i-1,'iterations: ', error
++     ncalcv = i-1
++  ENDIF
++  !
++  DEALLOCATE( hpsi, u, comp )
++  !
++END SUBROUTINE lanczos_acc
++#endif
+diff --git a/XSpectra/src/lr_sm1_psi.f90 b/XSpectra/src/lr_sm1_psi.f90
+index f591ac461..bbff536db 100644
+--- a/XSpectra/src/lr_sm1_psi.f90
++++ b/XSpectra/src/lr_sm1_psi.f90
+@@ -8,6 +8,102 @@
+ !----------------------------------------------------------------------------
+ 
+ 
++!----------------------------------------------------------------------------
++MODULE xs_sm1_data
++  !--------------------------------------------------------------------------
++  ! Holds the k-point matrix BB_ = -(1 + Q B)^-1 Q (B = <beta|beta>) used by
++  ! sm1_psi (host) and sm1_psi_acc (device, GPU build). Moved here from a
++  ! SAVEd local of sm1_psi_k so that both paths share it; the arithmetic of
++  ! the host path is unchanged.
++  USE kinds, ONLY : DP
++  IMPLICIT NONE
++  COMPLEX(DP), ALLOCATABLE :: BB_(:,:)
++  INTEGER :: bb_version = 0     ! incremented each time BB_ is rebuilt
++CONTAINS
++  !--------------------------------------------------------------------------
++  SUBROUTINE sm1_build_bb_k( n, lda )
++    !------------------------------------------------------------------------
++    USE uspp,       ONLY : vkb, nkb, qq_nt
++    USE uspp_param, ONLY : upf, nh
++    USE ions_base,  ONLY : nat, ntyp => nsp, ityp
++    USE mp,         ONLY : mp_sum
++    USE mp_pools,   ONLY : intra_pool_comm
++    IMPLICIT NONE
++    INTEGER, INTENT(IN) :: n, lda
++    INTEGER :: ikb, jkb, ih, jh, na, nt, ijkb0, ii
++    COMPLEX(DP), ALLOCATABLE :: ps(:,:)
++    !
++    call errore('sm1_psi','recalculating BB_ matrix',-1)
++
++    ALLOCATE( ps( nkb, nkb ) )    
++
++    call zgemm('C','N',nkb,nkb,n,(1.d0,0.d0),vkb,lda,vkb,lda,(0.d0,0.d0),BB_(1,1),nkb)
++    !******          CALL reduce( 2 * nkb * nkb, BB_ )
++    CALL mp_sum(  BB_, intra_pool_comm ) !CG
++
++    ps(:,:) = (0.d0,0.d0)
++    ijkb0 = 0
++    do nt=1,ntyp
++       if (upf(nt)%tvanp) then
++          do na=1,nat
++             if(ityp(na).eq.nt) then
++                do ii=1,nkb
++                   do jh=1,nh(nt)
++                      jkb=ijkb0 + jh
++                      do ih=1,nh(nt)
++                         ikb = ijkb0 + ih
++                         ps(ikb,ii) = ps(ikb,ii) + BB_(jkb,ii)*qq_nt(ih,jh,nt)
++                      enddo
++                   enddo
++                enddo
++                ijkb0 = ijkb0+nh(nt)
++             endif
++          enddo
++       else
++          DO na = 1, nat
++             IF ( ityp(na) == nt ) ijkb0 = ijkb0 + nh(nt)
++          END DO
++       endif
++    enddo
++
++    do ii=1,nkb
++       ps(ii,ii) = ps(ii,ii) + (1.d0,0.d0)
++    enddo
++
++    call zinv_matrix(ps,nkb)
++    BB_(:,:) = (0.d0,0.d0)
++    ijkb0 = 0
++    do nt=1,ntyp
++       if (upf(nt)%tvanp) then
++          do na=1,nat
++             if(ityp(na).eq.nt) then
++                do ii=1,nkb
++                   do jh=1,nh(nt)
++                      jkb=ijkb0 + jh
++                      do ih=1,nh(nt)
++                         ikb = ijkb0 + ih
++                         ! BB_(ii,jkb) = BB_(ii,jkb) - ps(ii,jkb)*qq_nt(ih,jh,nt) ! this seems false
++                         BB_(ii,jkb) = BB_(ii,jkb) - ps(ii,ikb)*qq_nt(ih,jh,nt) ! modified by CG
++                      enddo
++                   enddo
++                enddo
++                ijkb0 = ijkb0+nh(nt)
++             endif
++          enddo
++       else
++          DO na = 1, nat
++             IF ( ityp(na) == nt ) ijkb0 = ijkb0 + nh(nt)
++          END DO
++       endif
++    enddo
++    deallocate(ps)
++    bb_version = bb_version + 1
++    !
++  END SUBROUTINE sm1_build_bb_k
++  !
++END MODULE xs_sm1_data
++
++
+ !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ SUBROUTINE sm1_psi( recalc, lda, n, m, psi, spsi)
+ !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+@@ -189,6 +285,7 @@ CONTAINS
+     !
+     USE becmod,  ONLY : becp
+     USE klist, only :         xk
++    USE xs_sm1_data, ONLY : BB_, sm1_build_bb_k
+     USE mp,        ONLY : mp_sum  ! CG
+     USE mp_pools,  ONLY : intra_pool_comm ! CG
+     !
+@@ -199,7 +296,6 @@ CONTAINS
+     INTEGER :: ikb, jkb, ih, jh, na, nt, ijkb0, ibnd, ii, ik1
+     ! counters
+     complex(KIND=DP), ALLOCATABLE :: ps(:,:)
+-    complex(kind=dp), allocatable, save :: BB_(:,:)
+ 
+     ! the product vkb and psi
+     !
+@@ -216,72 +312,7 @@ CONTAINS
+        recalc = .true.
+     endif
+ 
+-    if(recalc) then
+-       call errore('sm1_psi','recalculating BB_ matrix',-1)
+-
+-       ALLOCATE( ps( nkb, nkb ) )    
+-
+-       call zgemm('C','N',nkb,nkb,n,(1.d0,0.d0),vkb,lda,vkb,lda,(0.d0,0.d0),BB_(1,1),nkb)
+-       !******          CALL reduce( 2 * nkb * nkb, BB_ )
+-       CALL mp_sum(  BB_, intra_pool_comm ) !CG
+-
+-       ps(:,:) = (0.d0,0.d0)
+-       ijkb0 = 0
+-       do nt=1,ntyp
+-          if (upf(nt)%tvanp) then
+-             do na=1,nat
+-                if(ityp(na).eq.nt) then
+-                   do ii=1,nkb
+-                      do jh=1,nh(nt)
+-                         jkb=ijkb0 + jh
+-                         do ih=1,nh(nt)
+-                            ikb = ijkb0 + ih
+-                            ps(ikb,ii) = ps(ikb,ii) + BB_(jkb,ii)*qq_nt(ih,jh,nt)
+-                         enddo
+-                      enddo
+-                   enddo
+-                   ijkb0 = ijkb0+nh(nt)
+-                endif
+-             enddo
+-          else
+-             DO na = 1, nat
+-                IF ( ityp(na) == nt ) ijkb0 = ijkb0 + nh(nt)
+-             END DO
+-          endif
+-       enddo
+-
+-       do ii=1,nkb
+-          ps(ii,ii) = ps(ii,ii) + (1.d0,0.d0)
+-       enddo
+-
+-       call zinv_matrix(ps,nkb)
+-       BB_(:,:) = (0.d0,0.d0)
+-       ijkb0 = 0
+-       do nt=1,ntyp
+-          if (upf(nt)%tvanp) then
+-             do na=1,nat
+-                if(ityp(na).eq.nt) then
+-                   do ii=1,nkb
+-                      do jh=1,nh(nt)
+-                         jkb=ijkb0 + jh
+-                         do ih=1,nh(nt)
+-                            ikb = ijkb0 + ih
+-                            ! BB_(ii,jkb) = BB_(ii,jkb) - ps(ii,jkb)*qq_nt(ih,jh,nt) ! this seems false
+-                            BB_(ii,jkb) = BB_(ii,jkb) - ps(ii,ikb)*qq_nt(ih,jh,nt) ! modified by CG
+-                         enddo
+-                      enddo
+-                   enddo
+-                   ijkb0 = ijkb0+nh(nt)
+-                endif
+-             enddo
+-          else
+-             DO na = 1, nat
+-                IF ( ityp(na) == nt ) ijkb0 = ijkb0 + nh(nt)
+-             END DO
+-          endif
+-       enddo
+-       deallocate(ps)
+-    endif
++    if(recalc) call sm1_build_bb_k( n, lda )
+ 
+     !     call calbec ( lda, vkb, psi, becp ) ! erreur ici ?
+ 
+@@ -470,3 +501,91 @@ SUBROUTINE pw_gemm( sum_over_nodes, na, nb, n, a, lda, b, ldb, c, ldc )
+   RETURN
+   !
+ END SUBROUTINE pw_gemm
++
++#if defined(__CUDA)
++!----------------------------------------------------------------------------
++SUBROUTINE sm1_psi_acc( recalc, lda, n, m, psi, spsi )
++  !----------------------------------------------------------------------------
++  !! GPU build, k-points: spsi = S^-1 psi with psi, spsi (and vkb) resident
++  !! on the device. Same algebra as sm1_psi_k:
++  !!    spsi = psi + vkb * BB_ * (vkb^H psi)
++  !! BB_ is built on the host (sm1_build_bb_k, once per k-point) and mirrored
++  !! on the device whenever its version changes.
++  !
++  USE kinds,       ONLY : DP
++  USE uspp,        ONLY : okvan, vkb, nkb
++  USE xs_sm1_data, ONLY : BB_, bb_version, sm1_build_bb_k
++  USE mp_bands,    ONLY : intra_bgrp_comm
++  USE mp,          ONLY : mp_sum, mp_size
++  !
++  IMPLICIT NONE
++  !
++  LOGICAL     :: recalc
++  INTEGER     :: lda, n, m
++  COMPLEX(DP) :: psi(lda,m), spsi(lda,m)
++  !
++  INTEGER, SAVE :: bb_version_dev = -1   ! version of BB_ present on the device
++  COMPLEX(DP), ALLOCATABLE :: bec_d(:,:), ps_d(:,:)
++  INTEGER :: i, ibnd
++  !
++  CALL start_clock( 'sm1' )
++  !
++  !$acc parallel loop collapse(2) present(psi, spsi)
++  DO ibnd = 1, m
++     DO i = 1, lda
++        spsi(i,ibnd) = psi(i,ibnd)
++     END DO
++  END DO
++  !
++  IF ( nkb == 0 .OR. .NOT. okvan ) THEN
++     CALL stop_clock( 'sm1' )
++     RETURN
++  END IF
++  !
++  IF ( .NOT. ALLOCATED(BB_) ) THEN
++     ALLOCATE( BB_(nkb,nkb) )
++     recalc = .true.
++  END IF
++  IF ( recalc ) CALL sm1_build_bb_k( n, lda )     ! host vkb is up to date (init_us_2)
++  IF ( bb_version_dev /= bb_version ) THEN
++     IF ( bb_version_dev < 0 ) THEN
++        !$acc enter data copyin(BB_)
++     ELSE
++        !$acc update device(BB_)
++     END IF
++     bb_version_dev = bb_version
++  END IF
++  !
++  ALLOCATE( bec_d(nkb,m), ps_d(nkb,m) )
++  !$acc data present(vkb, psi, spsi, BB_) create(bec_d, ps_d)
++  !
++  ! bec_d = vkb^H psi   (as calbec_k: sum over the band group)
++  !$acc host_data use_device(vkb, psi, bec_d)
++  CALL MYZGEMM( 'C', 'N', nkb, m, n, (1.0_DP,0.0_DP), vkb, lda, psi, lda, &
++                (0.0_DP,0.0_DP), bec_d, nkb )
++  !$acc end host_data
++  IF ( mp_size(intra_bgrp_comm) > 1 ) THEN
++     !$acc host_data use_device(bec_d)
++     CALL mp_sum( bec_d, intra_bgrp_comm )
++     !$acc end host_data
++  END IF
++  !
++  ! ps_d = BB_ bec_d
++  !$acc host_data use_device(BB_, bec_d, ps_d)
++  CALL MYZGEMM( 'N', 'N', nkb, m, nkb, (1.0_DP,0.0_DP), BB_, nkb, bec_d, nkb, &
++                (0.0_DP,0.0_DP), ps_d, nkb )
++  !$acc end host_data
++  !
++  ! spsi = spsi + vkb ps_d
++  !$acc host_data use_device(vkb, ps_d, spsi)
++  CALL MYZGEMM( 'N', 'N', n, m, nkb, (1.0_DP,0.0_DP), vkb, lda, ps_d, nkb, &
++                (1.0_DP,0.0_DP), spsi, lda )
++  !$acc end host_data
++  !
++  !$acc end data
++  DEALLOCATE( bec_d, ps_d )
++  !
++  CALL stop_clock( 'sm1' )
++  !
++END SUBROUTINE sm1_psi_acc
++#endif
+-- 
+2.43.5
+

@@ -1,0 +1,48 @@
+From 5a0ccb1090736d0cbf4dfa4530bc5c8269999d9f Mon Sep 17 00:00:00 2001
+From: ynwang <ynwang@iis.u-tokyo.ac.jp>
+Date: Wed, 11 Nov 2026 16:09:30 +0900
+Subject: [PATCH 8/9] XSpectra: read the SCF data without copying the
+ wavefunctions
+
+read_file() reads every collected wavefunction and writes it again as a
+distributed buffer, which reset_k_points_and_reinit_nscf deletes right
+away; XSpectra never uses the SCF wavefunctions (the Lanczos starts from
+the core-projected vector). read_file_new does the same initialisation
+without touching the wfc files: setup of the 162-atom SiO2 run was ~90 s
+of NFS I/O (4.3 GB read + rewrite). Affects CPU and GPU builds.
+Check: Intel/MKL CPU build, small test, x/y/z bit-identical to before;
+GPU small test PASS (phase-2 criteria).
+---
+ XSpectra/src/xspectra.f90 | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/XSpectra/src/xspectra.f90 b/XSpectra/src/xspectra.f90
+index 5bbc7d670..0baa19937 100644
+--- a/XSpectra/src/xspectra.f90
++++ b/XSpectra/src/xspectra.f90
+@@ -78,6 +78,7 @@ PROGRAM X_Spectra
+ 
+   IMPLICIT NONE 
+   LOGICAL, EXTERNAL :: check_gpu_support
++  LOGICAL :: wfc_is_collected
+   !
+   ! ... local variables
+   !
+@@ -143,7 +144,13 @@ PROGRAM X_Spectra
+      WRITE(stdout,1001) ! line+return
+ 
+      CALL start_clock( 'xs_setup' )
+-     CALL read_file()
++     ! XSpectra never uses the SCF wavefunctions: the Lanczos starts from the
++     ! core-projected vector, and reset_k_points_and_reinit_nscf below deletes
++     ! the wfc buffer. read_file() would read all of them and write them again
++     ! (GBs for large cells); read_file_new does the same initialisation
++     ! without touching the wavefunction files.
++     wfc_is_collected = .true.
++     CALL read_file_new( wfc_is_collected )
+ 
+      CALL calculate_and_write_homo_lumo_to_stdout(ehomo,elumo)
+      ! Ef is broadcast to all processors - needed for k-point parallelization
+-- 
+2.43.5
+

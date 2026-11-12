@@ -1,0 +1,48 @@
+From aa930c00cd16ce730613e8935d041d502d7f8fbc Mon Sep 17 00:00:00 2001
+From: ynwang <ynwang@iis.u-tokyo.ac.jp>
+Date: Wed, 11 Nov 2026 13:46:34 +0900
+Subject: [PATCH 3/9] XSpectra: set use_gpu = check_gpu_support() at start-up
+
+As in pw.x (setup) and turboTDDFT (lr_main). Without it h_psi used the CPU
+add_vuspsi with the stale host becp while calbec wrote the device becp:
+Lanczos a(1) was 3.94 instead of 5.37 on the small SiO2 test. In a CPU-only
+build check_gpu_support() is .FALSE., so nothing changes there.
+---
+ XSpectra/src/xspectra.f90 | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/XSpectra/src/xspectra.f90 b/XSpectra/src/xspectra.f90
+index 732a22bcf..8230c2d1a 100644
+--- a/XSpectra/src/xspectra.f90
++++ b/XSpectra/src/xspectra.f90
+@@ -47,7 +47,7 @@ PROGRAM X_Spectra
+   USE mp_global,       ONLY : mp_startup, mp_global_end
+   USE mp_pools,        ONLY : intra_pool_comm, npool
+   USE mp_world,        ONLY : world_comm
+-  USE control_flags,   ONLY : gamma_only
++  USE control_flags,   ONLY : gamma_only, use_gpu
+   USE environment,     ONLY : environment_start
+ 
+   USE cut_valence_green, ONLY :&
+@@ -77,6 +77,7 @@ PROGRAM X_Spectra
+ #endif
+ 
+   IMPLICIT NONE 
++  LOGICAL, EXTERNAL :: check_gpu_support
+   !
+   ! ... local variables
+   !
+@@ -112,6 +113,10 @@ PROGRAM X_Spectra
+ #endif
+   CALL environment_start ( 'XSpectra' )
+ 
++  ! Select the accelerated PW routines (h_psi -> add_vuspsi_acc, ...) as pw.x
++  ! (setup) and turboTDDFT (lr_main) do; .FALSE. in a CPU-only build.
++  use_gpu = check_gpu_support()
++
+   CALL plugin_arguments()
+ 
+   CALL banner_xspectra()
+-- 
+2.43.5
+

@@ -1,0 +1,199 @@
+From b071026389d56656c21045fa0be918fdd6b517de Mon Sep 17 00:00:00 2001
+From: ynwang <ynwang@iis.u-tokyo.ac.jp>
+Date: Wed, 11 Nov 2026 14:29:03 +0900
+Subject: [PATCH 5/9] XSpectra GPU: stop on the norm-conserving Lanczos path
+
+Only lanczos_uspp (US/PAW, S^-1) has been validated on the GPU; the
+norm-conserving lanczos now calls errore in the GPU build instead of
+running unvalidated code, and lanczos_acc is removed (it remains in
+4ae25d92e). CPU build unchanged.
+---
+ XSpectra/src/lanczos.f90     |   7 +-
+ XSpectra/src/lanczos_acc.f90 | 143 +----------------------------------
+ 2 files changed, 7 insertions(+), 143 deletions(-)
+
+diff --git a/XSpectra/src/lanczos.f90 b/XSpectra/src/lanczos.f90
+index a214dc4b9..94d7281b1 100644
+--- a/XSpectra/src/lanczos.f90
++++ b/XSpectra/src/lanczos.f90
+@@ -45,9 +45,10 @@ SUBROUTINE lanczos (a,b,npw,psi,ncalcv,terminator)
+ 
+ 
+ #if defined(__CUDA)
+-  ! GPU build: device-resident recursion (lanczos_acc.f90)
+-  CALL lanczos_acc(a,b,npw,psi,ncalcv,terminator)
+-  RETURN
++  ! GPU build: only the ultrasoft/PAW recursion (lanczos_uspp_acc) has been
++  ! ported and validated; stop instead of giving unvalidated results.
++  CALL errore('lanczos', 'norm-conserving pseudopotentials (no S matrix) &
++       &are not supported by the GPU version of XSpectra', 1)
+ #endif
+ 
+   ALLOCATE(hpsi(npwx))
+diff --git a/XSpectra/src/lanczos_acc.f90 b/XSpectra/src/lanczos_acc.f90
+index 7d7b8c120..76ec90757 100644
+--- a/XSpectra/src/lanczos_acc.f90
++++ b/XSpectra/src/lanczos_acc.f90
+@@ -6,13 +6,14 @@
+ ! or http://www.gnu.org/copyleft/gpl.txt .
+ !
+ !------------------------------------------------------------------------------
+-! GPU (OpenACC) versions of lanczos and lanczos_uspp (lanczos.f90).
++! GPU (OpenACC) version of lanczos_uspp (lanczos.f90). The norm-conserving
++! lanczos has no GPU version: it stops with an error in the GPU build.
+ ! The Lanczos vectors stay on the device for the whole recursion; h_psi,
+ ! S^-1 (sm1_psi_acc) and the vector algebra run there, and only the scalars
+ ! a(i), b(i) come back to the host, where the convergence test (converge /
+ ! continued_fraction) is unchanged. Same recursion, same order of operations
+ ! as the host routines; only the summation order of the dot products differs.
+-! Compiled only in the GPU build; lanczos/lanczos_uspp dispatch here.
++! Compiled only in the GPU build; lanczos_uspp dispatches here.
+ !------------------------------------------------------------------------------
+ #if defined(__CUDA)
+ !------------------------------------------------------------------------------
+@@ -197,142 +198,4 @@ SUBROUTINE lanczos_uspp_acc( a, b, npw, psi, ncalcv, terminator )
+   DEALLOCATE( v1, v2, u, comp )
+   !
+ END SUBROUTINE lanczos_uspp_acc
+-!
+-!------------------------------------------------------------------------------
+-SUBROUTINE lanczos_acc( a, b, npw, psi, ncalcv, terminator )
+-  !----------------------------------------------------------------------------
+-  !! norm-conserving case (S = 1)
+-  USE kinds,     ONLY: DP
+-  USE wvfct,     ONLY: npwx
+-  USE becmod,    ONLY: becp
+-  USE constants, ONLY: rytoev
+-  USE xspectra,  ONLY: xniter, xnepoint, xcheck_conv, xnitermax, &
+-                       xemin, xemax, xgamma, xerror
+-  USE mp_pools,  ONLY: intra_pool_comm
+-  USE mp,        ONLY: mp_sum
+-  USE io_global, ONLY: stdout
+-  !
+-  IMPLICIT NONE
+-  !
+-  REAL(dp),    INTENT(INOUT) :: a(xnitermax), b(xnitermax)
+-  COMPLEX(dp), INTENT(INOUT) :: psi(npwx)
+-  INTEGER,     INTENT(INOUT) :: ncalcv
+-  INTEGER,     INTENT(IN)    :: npw
+-  LOGICAL,     INTENT(IN)    :: terminator
+-  !
+-  LOGICAL  :: converge, iconv, ldummy
+-  INTEGER  :: i, j
+-  REAL(dp) :: error, xemin_ry, xemax_ry, xgamma_ry, ai, bim1, rb
+-  REAL(dp), ALLOCATABLE :: comp(:)
+-  COMPLEX(dp), ALLOCATABLE :: hpsi(:), u(:)
+-  REAL(dp), EXTERNAL :: xs_rdot_acc
+-  EXTERNAL :: h_psi
+-  !
+-  ALLOCATE( hpsi(npwx), u(npwx), comp(xnepoint) )
+-  a(:) = 0.d0
+-  b(:) = 0.d0
+-  xemax_ry  = xemax/rytoev
+-  xemin_ry  = xemin/rytoev
+-  xgamma_ry = xgamma/rytoev
+-  iconv = .false.
+-  !
+-  CALL xs_check_gpu_support()
+-  !$acc enter data copyin(becp)
+-  !$acc enter data copyin(becp%k)
+-  !$acc data copy(psi) create(hpsi, u)
+-  !
+-  !$acc parallel loop present(hpsi, u)
+-  DO j = 1, npwx
+-     hpsi(j) = (0.d0,0.d0)
+-     u(j)    = (0.d0,0.d0)
+-  END DO
+-  !
+-  ! ------------------------  1st iteration --------------------------
+-  !
+-  CALL h_psi( npwx, npw, 1, psi, hpsi )              ! hpsi = H psi
+-  a(1) = xs_rdot_acc( npw, psi, hpsi )               ! a_1 = <psi|H psi>
+-  CALL mp_sum( a(1), intra_pool_comm )
+-  ai = a(1)
+-  !$acc parallel loop present(hpsi, psi)
+-  DO j = 1, npw
+-     hpsi(j) = hpsi(j) - ai*psi(j)
+-  END DO
+-  b(1) = xs_rdot_acc( npw, hpsi, hpsi )
+-  CALL mp_sum( b(1), intra_pool_comm )
+-  b(1) = SQRT( b(1) )
+-  rb = 1.d0/b(1)
+-  !$acc parallel loop present(hpsi, u)
+-  DO j = 1, npwx
+-     IF (j <= npw) THEN
+-        hpsi(j) = hpsi(j)*rb
+-        u(j) = hpsi(j)                               ! |u1>
+-     END IF
+-     hpsi(j) = (0.d0,0.d0)
+-  END DO
+-  !
+-  ! -------------------------- Next iterations -----------------------
+-  !
+-  comp(:) = 0.d0
+-  comp(1) = 1.d0
+-  !
+-  DO i = 2, xniter
+-     !   u = psi_j, hpsi = empty, psi = psi_j-1
+-     CALL h_psi( npwx, npw, 1, u, hpsi )
+-     !
+-     bim1 = b(i-1)
+-     !$acc parallel loop present(hpsi, psi)
+-     DO j = 1, npw
+-        hpsi(j) = hpsi(j) - bim1*psi(j)
+-     END DO
+-     a(i) = xs_rdot_acc( npw, hpsi, u )
+-     CALL mp_sum( a(i), intra_pool_comm )
+-     ai = a(i)
+-     !$acc parallel loop present(hpsi, u)
+-     DO j = 1, npw
+-        hpsi(j) = hpsi(j) - ai*u(j)
+-     END DO
+-     b(i) = xs_rdot_acc( npw, hpsi, hpsi )
+-     CALL mp_sum( b(i), intra_pool_comm )
+-     b(i) = SQRT( b(i) )
+-     rb = 1.d0/b(i)
+-     !$acc parallel loop present(psi, u, hpsi)
+-     DO j = 1, npw
+-        psi(j)  = u(j)
+-        u(j)    = hpsi(j)*rb
+-        hpsi(j) = (0.d0,0.d0)
+-     END DO
+-     !
+-     IF (MOD(i,xcheck_conv) == 0) THEN
+-        IF (converge(a, b, i, comp, error, xemin_ry, xemax_ry, &
+-                     xgamma_ry, xnepoint, xerror, terminator)) THEN
+-           WRITE(stdout,'(8x,a,i6,a,f12.8)') '!   => CONVERGED at iter ',i,&
+-                                             ' with error=',error
+-           ncalcv = i
+-           iconv = .true.
+-           EXIT
+-        ELSE
+-           WRITE(stdout,'(8x,a,i6,a,f12.8)') '|   Estimated error at iter ',i,&
+-                                             ': ', error
+-        ENDIF
+-     ENDIF
+-     !
+-  ENDDO
+-  !
+-  !$acc end data
+-  !$acc exit data delete(becp%k)
+-  !$acc exit data delete(becp)
+-  !
+-  IF (.NOT.iconv) THEN
+-     ldummy = converge(a,b,i-1,comp,error,xemin_ry,xemax_ry,&
+-                       xgamma_ry,xnepoint,xerror,terminator)
+-     WRITE(stdout,'(8x,a,i6,a)') '!   XANES not converged after', i-1,&
+-                                 ' iterations'
+-     WRITE(stdout,'(8x,a,i6,a,f12.8)') '!   Estimated final error after ',&
+-          i-1,'iterations: ', error
+-     ncalcv = i-1
+-  ENDIF
+-  !
+-  DEALLOCATE( hpsi, u, comp )
+-  !
+-END SUBROUTINE lanczos_acc
+ #endif
+-- 
+2.43.5
+

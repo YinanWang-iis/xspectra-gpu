@@ -1,0 +1,32 @@
+From 6f956d06977bab31cc912db6cbea8a47ca3ea542 Mon Sep 17 00:00:00 2001
+From: ynwang <ynwang@iis.u-tokyo.ac.jp>
+Date: Wed, 11 Nov 2026 13:21:19 +0900
+Subject: [PATCH 1/9] local: -Mnoinline for wannier90 disentangle.F90
+ (nvfortran 26.3 ICE)
+
+---
+ external/wannier90.cmake | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/external/wannier90.cmake b/external/wannier90.cmake
+index ab41ad68f..9e7055071 100644
+--- a/external/wannier90.cmake
++++ b/external/wannier90.cmake
+@@ -52,6 +52,14 @@ if(QE_WANNIER90_INTERNAL)
+     endif()
+     add_subdirectory(wannier90)
+ 
++    # [local patch, ynwang 2026-11-11] NVHPC 26.3 hits an internal compiler error
++    # (gen_llvm_expr: no incoming ili) when inlining the recursive internal
++    # subroutine `search` in disentangle.F90; -Mnoinline avoids it.
++    if(CMAKE_Fortran_COMPILER_ID MATCHES "PGI|NVHPC")
++        set_source_files_properties(wannier90/src/disentangle.F90
++            DIRECTORY wannier90 PROPERTIES COMPILE_OPTIONS "-Mnoinline")
++    endif()
++
+     if(BLA_VENDOR STREQUAL "NVPL")
+         set(CMAKE_MODULE_PATH ${_qe_wannier90_saved_module_path})
+         unset(_qe_wannier90_saved_module_path)
+-- 
+2.43.5
+

@@ -1,0 +1,35 @@
+### native
+npw=30000 nb=520  math mode of env handle = 0
+  env     C^H N :   273.513 ms/call     0.95 TFLOP/s  max rel err  0.00E+00
+  env     N  N  :   266.997 ms/call     0.97 TFLOP/s  max rel err  0.00E+00
+ reference written (native run)
+### emulation, mantissa default
+npw=30000 nb=520  math mode of env handle = 0
+  env     C^H N :    48.994 ms/call     5.30 TFLOP/s  max rel err  0.00E+00
+  env     N  N  :    53.445 ms/call     4.86 TFLOP/s  max rel err  0.00E+00
+  vs NATIVE FP64 file:  C^H N max rel err 1.811E-14   N N max rel err 8.882E-15
+  C^H N median-ish |dC|/|C| (diag): 9.688E-15
+### emulation, mantissa 52
+npw=30000 nb=520  math mode of env handle = 0
+  env     C^H N :    38.485 ms/call     6.74 TFLOP/s  max rel err  0.00E+00
+  env     N  N  :    42.322 ms/call     6.13 TFLOP/s  max rel err  0.00E+00
+  vs NATIVE FP64 file:  C^H N max rel err 1.811E-14   N N max rel err 8.954E-15
+  C^H N median-ish |dC|/|C| (diag): 9.702E-15
+### emulation, mantissa 44
+npw=30000 nb=520  math mode of env handle = 0
+  env     C^H N :    29.844 ms/call     8.70 TFLOP/s  max rel err  0.00E+00
+  env     N  N  :    33.670 ms/call     7.71 TFLOP/s  max rel err  0.00E+00
+  vs NATIVE FP64 file:  C^H N max rel err 3.494E-14   N N max rel err 7.388E-14
+  C^H N median-ish |dC|/|C| (diag): 5.285E-14
+### emulation, mantissa 40
+npw=30000 nb=520  math mode of env handle = 0
+  env     C^H N :    29.874 ms/call     8.69 TFLOP/s  max rel err  0.00E+00
+  env     N  N  :    33.685 ms/call     7.71 TFLOP/s  max rel err  0.00E+00
+  vs NATIVE FP64 file:  C^H N max rel err 3.494E-14   N N max rel err 7.388E-14
+  C^H N median-ish |dC|/|C| (diag): 5.285E-14
+### emulation, mantissa 32
+npw=30000 nb=520  math mode of env handle = 0
+  env     C^H N :    22.310 ms/call    11.64 TFLOP/s  max rel err  0.00E+00
+  env     N  N  :    26.118 ms/call     9.94 TFLOP/s  max rel err  0.00E+00
+  vs NATIVE FP64 file:  C^H N max rel err 1.062E-11   N N max rel err 1.995E-11
+  C^H N median-ish |dC|/|C| (diag): 1.387E-11

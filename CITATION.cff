@@ -1,0 +1,95 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below, together with Quantum ESPRESSO and XSpectra (see README)."
+title: "XSpectra on the GPU (OpenACC) — patches for dm_qe"
+abstract: "GPU (OpenACC) port of Quantum ESPRESSO's XSpectra (K-edge dipole/quadrupole and L3 edge, ultrasoft/PAW) as patches on Discovered Materials' GPU fork of Quantum ESPRESSO (dm_qe)."
+authors:
+  - family-names: "Wang"
+    given-names: "Yinan"
+    affiliation: "Institute of Industrial Science, The University of Tokyo"
+    email: "ynwang@iis.u-tokyo.ac.jp"
+    orcid: "https://orcid.org/0009-0008-8642-6753"
+repository-code: "https://github.com/YinanWang-iis/xspectra-gpu"
+license: GPL-2.0-or-later
+date-released: "2026-11-11"
+version: "0.1"
+keywords:
+  - Quantum ESPRESSO
+  - XSpectra
+  - XANES
+  - ELNES
+  - GPU
+  - OpenACC
+references:
+  - type: software
+    title: "dm_qe: Discovered Materials' GPU fork of Quantum ESPRESSO"
+    repository-code: "https://github.com/discovered-materials/dm_qe"
+    authors:
+      - name: "Discovered Materials"
+  - type: article
+    title: "QUANTUM ESPRESSO: a modular and open-source software project for quantum simulations of materials"
+    authors:
+      - family-names: "Giannozzi"
+        given-names: "Paolo"
+    journal: "Journal of Physics: Condensed Matter"
+    volume: 21
+    start: 395502
+    year: 2009
+  - type: article
+    title: "Advanced capabilities for materials modelling with Quantum ESPRESSO"
+    authors:
+      - family-names: "Giannozzi"
+        given-names: "Paolo"
+    journal: "Journal of Physics: Condensed Matter"
+    volume: 29
+    start: 465901
+    year: 2017
+  - type: article
+    title: "Quantum ESPRESSO toward the exascale"
+    authors:
+      - family-names: "Giannozzi"
+        given-names: "Paolo"
+    journal: "The Journal of Chemical Physics"
+    volume: 152
+    start: 154105
+    year: 2020
+  - type: article
+    title: "X-ray absorption near-edge structure calculations with the pseudopotentials: Application to the K edge in diamond and alpha-quartz"
+    authors:
+      - family-names: "Taillefumier"
+        given-names: "Mathieu"
+      - family-names: "Cabaret"
+        given-names: "Delphine"
+      - family-names: "Flank"
+        given-names: "Anne-Marie"
+      - family-names: "Mauri"
+        given-names: "Francesco"
+    journal: "Physical Review B"
+    volume: 66
+    start: 195107
+    year: 2002
+  - type: article
+    title: "First-principles calculations of x-ray absorption in a scheme based on ultrasoft pseudopotentials: From alpha-quartz to high-Tc compounds"
+    authors:
+      - family-names: "Gougoussis"
+        given-names: "Christos"
+      - family-names: "Calandra"
+        given-names: "Matteo"
+      - family-names: "Seitsonen"
+        given-names: "Ari P."
+      - family-names: "Mauri"
+        given-names: "Francesco"
+    journal: "Physical Review B"
+    volume: 80
+    start: 075102
+    year: 2009
+  - type: article
+    title: "Projector augmented wave calculation of x-ray absorption spectra at the L2,3 edges"
+    authors:
+      - family-names: "Bunau"
+        given-names: "Oana"
+      - family-names: "Calandra"
+        given-names: "Matteo"
+    journal: "Physical Review B"
+    volume: 87
+    start: 205105
+    year: 2013

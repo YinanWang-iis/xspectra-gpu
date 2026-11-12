@@ -1,0 +1,136 @@
+From e3821a85792684872e2119ce46c5a23ed911025b Mon Sep 17 00:00:00 2001
+From: ynwang <ynwang@iis.u-tokyo.ac.jp>
+Date: Wed, 11 Nov 2026 13:46:34 +0900
+Subject: [PATCH 2/9] XSpectra GPU step 1: device data regions around h_psi in
+ lanczos/lanczos_uspp
+
+h_psi in the OpenACC build expects psi/hpsi and becp to be device-resident.
+- mirror the caller-allocated becp (struct + becp%k) on the device for the
+  duration of the Lanczos recursion (enter/exit data)
+- create the Lanczos work vectors on the device; update device before and
+  update self after each h_psi call (vector algebra still on the host)
+- xs_check_gpu_support(): explicit error for gamma_only / noncollinear in
+  the GPU build
+CPU build: directives are inert, no code change.
+---
+ XSpectra/src/lanczos.f90 | 50 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+
+diff --git a/XSpectra/src/lanczos.f90 b/XSpectra/src/lanczos.f90
+index 10cfcc2a1..0708b47bf 100644
+--- a/XSpectra/src/lanczos.f90
++++ b/XSpectra/src/lanczos.f90
+@@ -59,11 +59,21 @@ SUBROUTINE lanczos (a,b,npw,psi,ncalcv,terminator)
+ 
+   iconv=.false.
+ 
++#if defined(__CUDA)
++  ! GPU build: h_psi works on device-resident arrays (present/host_data).
++  ! becp is allocated on the host by the caller -> mirror it on the device.
++  CALL xs_check_gpu_support()
++  !$acc enter data copyin(becp)
++  !$acc enter data copyin(becp%k)
++  !$acc data create(psi, hpsi, u)
++#endif
+   ! ------------------------  1st iteration --------------------------
+   !
+   ! -- computes H*Psi  (|u0>=|Psi>)
+ 
++  !$acc update device(psi)
+   CALL h_psi( npwx, npw,1, psi, hpsi )
++  !$acc update self(hpsi)
+ 
+ 
+   ! -- computes a_(1)=<Psi|HPsi>
+@@ -116,7 +126,9 @@ SUBROUTINE lanczos (a,b,npw,psi,ncalcv,terminator)
+      !   hpsi=empty
+      !   psi=psi_j-1
+ 
++     !$acc update device(u)
+      CALL h_psi( npwx, npw, 1, u, hpsi )
++     !$acc update self(hpsi)
+ 
+ 
+      !
+@@ -180,6 +192,12 @@ SUBROUTINE lanczos (a,b,npw,psi,ncalcv,terminator)
+ 
+   ENDDO
+ 
++#if defined(__CUDA)
++  !$acc end data
++  !$acc exit data delete(becp%k)
++  !$acc exit data delete(becp)
++#endif
++
+   IF(.NOT.iconv) THEN
+      ldummy=converge(a,b,i-1,comp,error,xemin_ry,xemax_ry,&
+                    xgamma_ry,xnepoint,xerror,terminator) 
+@@ -260,11 +278,21 @@ SUBROUTINE lanczos_uspp (a,b,npw,psi,ncalcv,terminator)
+ 
+   iconv=.false.
+ 
++#if defined(__CUDA)
++  ! GPU build: h_psi works on device-resident arrays (present/host_data).
++  ! becp is allocated on the host by the caller -> mirror it on the device.
++  CALL xs_check_gpu_support()
++  !$acc enter data copyin(becp)
++  !$acc enter data copyin(becp%k)
++  !$acc data create(v1, v2, u)
++#endif
+   ! ------------------------  1st iteration --------------------------
+   !
+   recalc=.true.
+   CALL sm1_psi(recalc,npwx, npw, 1, psi, v1) ! -- computes v1= S^-1 psi
++  !$acc update device(v1)
+   CALL h_psi( npwx, npw,1, v1, u )           ! -- computes u = H v1
++  !$acc update self(u)
+ 
+   ! -- computes a_(1)=<v1|u>
+ 
+@@ -296,7 +324,9 @@ SUBROUTINE lanczos_uspp (a,b,npw,psi,ncalcv,terminator)
+ 
+   DO i=2,xniter
+ 
++     !$acc update device(v1)
+      CALL h_psi( npwx, npw,1, v1,v2)         ! -- computes v2= H v1
++     !$acc update self(v2)
+ 
+      a(i)=ddot(2*npw,v1,1,v2,1)              ! -- computes a_i=<v1|v2>
+      CALL mp_sum( a(i), intra_pool_comm )
+@@ -345,6 +375,12 @@ SUBROUTINE lanczos_uspp (a,b,npw,psi,ncalcv,terminator)
+ 
+   ENDDO
+ 
++#if defined(__CUDA)
++  !$acc end data
++  !$acc exit data delete(becp%k)
++  !$acc exit data delete(becp)
++#endif
++
+   IF(.NOT.iconv) THEN
+      WRITE(stdout,'(8x,a,i6,a)') '!   XANES not converged after', i-1,&
+                                  ' iterations'
+@@ -362,6 +398,20 @@ END SUBROUTINE lanczos_uspp
+ 
+ !</CG>
+ 
++!------------------------------------------------------------------------------
++SUBROUTINE xs_check_gpu_support()
++  !----------------------------------------------------------------------------
++  ! GPU build only: the device path of lanczos/lanczos_uspp assumes a
++  ! collinear k-point calculation (becp%k, one npwx-long vector).
++  USE control_flags,    ONLY : gamma_only
++  USE noncollin_module, ONLY : noncolin
++  IMPLICIT NONE
++  IF (gamma_only) CALL errore('xspectra', &
++       'gamma_only is not supported by the GPU version of XSpectra', 1)
++  IF (noncolin) CALL errore('xspectra', &
++       'noncollinear calculations are not supported by the GPU version of XSpectra', 1)
++END SUBROUTINE xs_check_gpu_support
++
+ !------------------------------------------------------------------------------
+ !------------------------------------------------------------------------------
+ LOGICAL FUNCTION converge(a,b,m,comp,estimated_error,xemin,xemax,xgamma,&
+-- 
+2.43.5
+

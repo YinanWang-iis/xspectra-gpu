@@ -1,0 +1,85 @@
+! ZGEMM benchmark for cuBLAS FP64 emulation (CUBLAS_EMULATE_DOUBLE_PRECISION etc. read from env).
+! Shapes typical of pw.x Davidson for the 162-atom SiO2 cell (npw ~ PWs per k, nb = bands):
+!   'C','N': nb2 x nb2 x npw  (subspace H, S matrices)     'N','N': npw x nb x nb2 (rotation)
+! Accuracy: relative to a reference computed with emulation explicitly disabled
+! (cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH) on a second handle -> native FP64).
+program zgemm_bench
+  use cudafor
+  use cublas_v2
+  implicit none
+  integer :: npw, nb, nb2, ierr, rep, nrep, it
+  character(len=32) :: arg
+  complex(8), allocatable, device :: A(:,:), B(:,:), C(:,:), Cref(:,:), P(:,:), R(:,:), Rref(:,:)
+  complex(8), allocatable :: h1(:,:), h2(:,:), hR(:,:), hRref(:,:)
+  real(8), allocatable :: rr(:,:), ri(:,:)
+  type(cublasHandle) :: hemu, hnat
+  type(cudaEvent) :: e0, e1
+  real :: tms
+  real(8) :: flops, err1, err2
+  integer(4) :: mode
+  npw = 30000; nb = 520; nrep = 10
+  if (command_argument_count() >= 1) then; call get_command_argument(1, arg); read(arg,*) npw; end if
+  if (command_argument_count() >= 2) then; call get_command_argument(2, arg); read(arg,*) nb; end if
+  nb2 = 2*nb
+  allocate(A(npw,nb2), B(npw,nb2), C(nb2,nb2), Cref(nb2,nb2), P(npw,nb), R(npw,nb2), Rref(npw,nb2))
+  allocate(rr(npw,nb2), ri(npw,nb2), h1(nb2,nb2), h2(nb2,nb2), hR(npw,nb2), hRref(npw,nb2))
+  call random_number(rr); call random_number(ri); h2 = 0
+  A = cmplx(rr-0.5d0, ri-0.5d0, 8)
+  call random_number(rr); call random_number(ri)
+  B = cmplx(rr-0.5d0, ri-0.5d0, 8)
+  ierr = cublasCreate(hemu); ierr = cublasCreate(hnat)
+  ierr = cublasSetMathMode(hnat, CUBLAS_DEFAULT_MATH)          ! native FP64 reference
+  ierr = cublasGetMathMode(hemu, mode)
+  call flush(6)
+  print '(a,i0,a,i0,a,i0)', 'npw=', npw, ' nb=', nb, '  math mode of env handle = ', mode
+  ierr = cudaEventCreate(e0); ierr = cudaEventCreate(e1)
+  do it = 1, 2
+    ! ---- 'C','N' : C = A^H B   (nb2 x nb2, inner npw)
+    ierr = cublasZgemm(merge(hnat,hemu,it==1), CUBLAS_OP_C, CUBLAS_OP_N, nb2, nb2, npw, (1d0,0d0), A, npw, B, npw, (0d0,0d0), C, nb2)
+    ierr = cudaDeviceSynchronize(); ierr = cudaEventRecord(e0, 0)
+    do rep = 1, nrep
+      ierr = cublasZgemm(merge(hnat,hemu,it==1), CUBLAS_OP_C, CUBLAS_OP_N, nb2, nb2, npw, (1d0,0d0), A, npw, B, npw, (0d0,0d0), C, nb2)
+    end do
+    ierr = cudaEventRecord(e1, 0); ierr = cudaEventSynchronize(e1); ierr = cudaEventElapsedTime(tms, e0, e1)
+    flops = 8d0*nb2*nb2*dble(npw)*nrep/(tms*1d-3)
+    if (it == 1) then
+      Cref = C
+      print '(a,f9.3,a,f8.2,a)', '  native  C^H N : ', tms/nrep, ' ms/call ', flops*1d-12, ' TFLOP/s'
+    else
+      h1 = C; h2 = Cref
+      err1 = maxval(abs(h1-h2))/maxval(abs(h2))
+      print '(a,f9.3,a,f8.2,a,es9.2)', '  env     C^H N : ', tms/nrep, ' ms/call ', flops*1d-12, ' TFLOP/s  max rel err ', err1
+    end if
+    ! ---- 'N','N' : R = A(:,1:nb2) * C  (npw x nb2, inner nb2)  ~ subspace rotation
+    ierr = cudaDeviceSynchronize(); ierr = cudaEventRecord(e0, 0)
+    do rep = 1, nrep
+      ierr = cublasZgemm(merge(hnat,hemu,it==1), CUBLAS_OP_N, CUBLAS_OP_N, npw, nb2, nb2, (1d0,0d0), A, npw, Cref, nb2, (0d0,0d0), R, npw)
+    end do
+    ierr = cudaEventRecord(e1, 0); ierr = cudaEventSynchronize(e1); ierr = cudaEventElapsedTime(tms, e0, e1)
+    flops = 8d0*nb2*nb2*dble(npw)*nrep/(tms*1d-3)
+    if (it == 1) then
+      Rref = R
+      print '(a,f9.3,a,f8.2,a)', '  native  N  N  : ', tms/nrep, ' ms/call ', flops*1d-12, ' TFLOP/s'
+    else
+      hR = R; hRref = Rref                     ! bulk device->host copies
+      err2 = maxval(abs(hR-hRref))/maxval(abs(hRref))
+      print '(a,f9.3,a,f8.2,a,es9.2)', '  env     N  N  : ', tms/nrep, ' ms/call ', flops*1d-12, ' TFLOP/s  max rel err ', err2
+    end if
+  end do
+  ! ---- accuracy vs a reference written by a run WITHOUT CUBLAS_EMULATE_* (env BENCH_REF=write|compare)
+  call get_environment_variable('BENCH_REF', arg)
+  h1 = C; hR = R
+  if (trim(arg) == 'write') then
+    open(10, file='ref.bin', form='unformatted', access='stream', status='replace')
+    write(10) h1, hR(1:2000,:); close(10)
+    print *, 'reference written (native run)'
+  else if (trim(arg) == 'compare') then
+    open(10, file='ref.bin', form='unformatted', access='stream', status='old')
+    read(10) h2, hRref(1:2000,:); close(10)
+    err1 = maxval(abs(h1-h2))/maxval(abs(h2))
+    err2 = maxval(abs(hR(1:2000,:)-hRref(1:2000,:)))/maxval(abs(hRref(1:2000,:)))
+    print '(a,es10.3,a,es10.3)', '  vs NATIVE FP64 file:  C^H N max rel err', err1, '   N N max rel err', err2
+    ! typical element-wise error (relative to each element's magnitude)
+    print '(a,es10.3)', '  C^H N median-ish |dC|/|C| (diag):', sum(abs(h1(1:nb2:37,1:nb2:37)-h2(1:nb2:37,1:nb2:37))/abs(h2(1:nb2:37,1:nb2:37)))/size(h2(1:nb2:37,1:nb2:37))
+  end if
+end program

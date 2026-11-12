@@ -1,0 +1,18 @@
+### EMULATE_DOUBLE=1 (default strategy)
+npw=30000 nb=520  math mode of env handle = 0
+  native  C^H N :    47.568 ms/call     5.46 TFLOP/s
+  native  N  N  :    53.429 ms/call     4.86 TFLOP/s
+  env     C^H N :    48.153 ms/call     5.39 TFLOP/s  max rel err  0.00E+00
+  env     N  N  :    53.323 ms/call     4.87 TFLOP/s  max rel err  0.00E+00
+### EMULATE_DOUBLE=1 EAGER
+npw=30000 nb=520  math mode of env handle = 0
+  native  C^H N :    47.883 ms/call     5.42 TFLOP/s
+  native  N  N  :    53.542 ms/call     4.85 TFLOP/s
+  env     C^H N :    48.526 ms/call     5.35 TFLOP/s  max rel err  0.00E+00
+  env     N  N  :    53.387 ms/call     4.86 TFLOP/s  max rel err  0.00E+00
+### EMULATE_DOUBLE=1 EAGER mantissa 40
+npw=30000 nb=520  math mode of env handle = 0
+  native  C^H N :    29.029 ms/call     8.94 TFLOP/s
+  native  N  N  :    33.767 ms/call     7.69 TFLOP/s
+  env     C^H N :    29.505 ms/call     8.80 TFLOP/s  max rel err  0.00E+00
+  env     N  N  :    33.650 ms/call     7.71 TFLOP/s  max rel err  0.00E+00

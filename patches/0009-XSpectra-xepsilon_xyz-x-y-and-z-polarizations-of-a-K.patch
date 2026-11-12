@@ -1,0 +1,582 @@
+From 0a98134dd8f0b53dcf5242065d588e4ccf74aa8f Mon Sep 17 00:00:00 2001
+From: ynwang <ynwang@iis.u-tokyo.ac.jp>
+Date: Wed, 11 Nov 2026 16:30:47 +0900
+Subject: [PATCH 9/9] XSpectra: xepsilon_xyz - x, y and z polarizations of a
+ K-edge dipole run together
+
+New &input_xspectra flag xepsilon_xyz (default .false.): the three
+Cartesian polarizations are computed in one run (one setup, one S^-1
+matrix per k-point) and written as three standard single-polarization
+outputs (_x/_y/_z inserted before the extension of x_save_file and
+xanes_file). Only for xanes_dipole at s edges; restart and xonly_plot
+stop with an error.
+- GPU build: lanczos_uspp_acc_batch advances the chains together, h_psi
+  and S^-1 act on all active chains at once (one pass over vkb, batched
+  FFTs); each chain keeps its own coefficients and convergence test and
+  leaves the batch when converged.
+- CPU build: the chains run one after the other with the original
+  lanczos_uspp (shared setup).
+- xanes_dipole generalised to n_lanczos chains; the single-polarization
+  path performs the same operations as before.
+Small test: Intel CPU single-polarization bit-identical to before, CPU
+batch bit-identical to three single runs; GPU single and batch PASS the
+phase-2 criteria.
+---
+ XSpectra/src/lanczos_acc.f90                  | 192 ++++++++++++++++++
+ XSpectra/src/read_input_and_bcast.f90         |   2 +
+ .../src/set_xspectra_namelists_defaults.f90   |   1 +
+ XSpectra/src/xanes_dipole.f90                 |  92 ++++++---
+ XSpectra/src/xspectra.f90                     |  71 ++++++-
+ XSpectra/src/xspectra_mod.f90                 |   4 +
+ 6 files changed, 332 insertions(+), 30 deletions(-)
+
+diff --git a/XSpectra/src/lanczos_acc.f90 b/XSpectra/src/lanczos_acc.f90
+index 76ec90757..cdbd97a52 100644
+--- a/XSpectra/src/lanczos_acc.f90
++++ b/XSpectra/src/lanczos_acc.f90
+@@ -198,4 +198,196 @@ SUBROUTINE lanczos_uspp_acc( a, b, npw, psi, ncalcv, terminator )
+   DEALLOCATE( v1, v2, u, comp )
+   !
+ END SUBROUTINE lanczos_uspp_acc
++!
++!------------------------------------------------------------------------------
++SUBROUTINE lanczos_uspp_acc_batch( a, b, npw, psi, ncalcv, terminator, nch )
++  !----------------------------------------------------------------------------
++  !! nch independent Lanczos chains of the same k-point (xepsilon_xyz: the x, y
++  !! and z polarizations) advanced together. h_psi and S^-1 act on all active
++  !! chains in one call (one pass over vkb for nch vectors, batched FFTs); every
++  !! chain keeps its own coefficients and convergence test exactly as in
++  !! lanczos_uspp_acc, and leaves the batch when it has converged (its columns
++  !! are swapped with the last active ones so that active columns stay first).
++  USE kinds,     ONLY: DP
++  USE wvfct,     ONLY: npwx
++  USE becmod,    ONLY: becp
++  USE constants, ONLY: rytoev
++  USE xspectra,  ONLY: xniter, xnepoint, xcheck_conv, xnitermax, &
++                       xemin, xemax, xgamma, xerror
++  USE mp_pools,  ONLY: intra_pool_comm
++  USE mp,        ONLY: mp_sum
++  USE io_global, ONLY: stdout
++  !
++  IMPLICIT NONE
++  !
++  INTEGER,     INTENT(IN)    :: nch, npw
++  REAL(dp),    INTENT(INOUT) :: a(xnitermax,nch), b(xnitermax,nch)
++  COMPLEX(dp), INTENT(INOUT) :: psi(npwx,nch)
++  INTEGER,     INTENT(INOUT) :: ncalcv(nch)
++  LOGICAL,     INTENT(IN)    :: terminator
++  !
++  LOGICAL  :: converge, recalc, lconv
++  LOGICAL  :: iconv(nch)
++  INTEGER  :: i, j, c, ch, nact, col2ch(nch), itmp
++  REAL(dp) :: error, xemin_ry, xemax_ry, xgamma_ry, ai, bim1, rb
++  COMPLEX(dp) :: t
++  REAL(dp), ALLOCATABLE :: comp(:,:)
++  COMPLEX(dp), ALLOCATABLE :: u(:,:), v1(:,:), v2(:,:)
++  REAL(dp), EXTERNAL :: xs_rdot_acc
++  EXTERNAL :: h_psi
++  !
++  ALLOCATE( v1(npwx,nch), v2(npwx,nch), u(npwx,nch), comp(xnepoint,nch) )
++  a(:,:) = 0.d0
++  b(:,:) = 0.d0
++  xemax_ry  = xemax/rytoev
++  xemin_ry  = xemin/rytoev
++  xgamma_ry = xgamma/rytoev
++  iconv(:) = .false.
++  DO c = 1, nch
++     col2ch(c) = c
++  END DO
++  nact = nch
++  !
++  CALL xs_check_gpu_support()
++  !$acc enter data copyin(becp)
++  !$acc enter data copyin(becp%k)
++  !$acc data copy(psi) create(u, v1, v2)
++  !
++  !$acc parallel loop collapse(2) present(u, v1, v2)
++  DO c = 1, nch
++     DO j = 1, npwx
++        u(j,c)  = (0.d0,0.d0)
++        v1(j,c) = (0.d0,0.d0)
++        v2(j,c) = (0.d0,0.d0)
++     END DO
++  END DO
++  !
++  ! ------------------------  1st iteration (all chains) ----------------------
++  !
++  recalc = .true.
++  CALL sm1_psi_acc( recalc, npwx, npw, nch, psi, v1 )   ! v1 = S^-1 psi
++  CALL h_psi( npwx, npw, nch, v1, u )                   ! u  = H v1
++  DO c = 1, nch
++     a(1,c) = xs_rdot_acc( npw, v1(1,c), u(1,c) )
++     CALL mp_sum( a(1,c), intra_pool_comm )
++     ai = a(1,c)
++     !$acc parallel loop present(u, psi)
++     DO j = 1, npw
++        u(j,c) = u(j,c) - ai*psi(j,c)
++     END DO
++  END DO
++  recalc = .false.
++  CALL sm1_psi_acc( recalc, npwx, npw, nch, u, v1 )     ! v1 = S^-1 u
++  DO c = 1, nch
++     b(1,c) = xs_rdot_acc( npw, u(1,c), v1(1,c) )
++     CALL mp_sum( b(1,c), intra_pool_comm )
++     b(1,c) = SQRT( b(1,c) )
++     rb = 1.d0/b(1,c)
++     !$acc parallel loop present(u, v1)
++     DO j = 1, npw
++        u(j,c)  = u(j,c)*rb
++        v1(j,c) = v1(j,c)*rb
++     END DO
++  END DO
++  !
++  ! -------------------------- Next iterations -------------------------------
++  !
++  comp(:,:) = 0.d0
++  comp(1,:) = 1.d0
++  !
++  DO i = 2, xniter
++     !
++     CALL h_psi( npwx, npw, nact, v1, v2 )              ! v2 = H v1 (active columns)
++     !
++     DO c = 1, nact
++        ch = col2ch(c)
++        a(i,ch) = xs_rdot_acc( npw, v1(1,c), v2(1,c) )
++        CALL mp_sum( a(i,ch), intra_pool_comm )
++        ai = a(i,ch)
++        bim1 = b(i-1,ch)
++        !$acc parallel loop present(v2, psi, u)
++        DO j = 1, npw
++           v2(j,c) = v2(j,c) - bim1*psi(j,c)
++           v2(j,c) = v2(j,c) - ai*u(j,c)
++        END DO
++     END DO
++     !
++     !$acc parallel loop collapse(2) present(v1)
++     DO c = 1, nact
++        DO j = 1, npwx
++           v1(j,c) = (0.d0,0.d0)
++        END DO
++     END DO
++     recalc = .false.
++     CALL sm1_psi_acc( recalc, npwx, npw, nact, v2, v1 ) ! v1 = S^-1 v2
++     !
++     DO c = 1, nact
++        ch = col2ch(c)
++        b(i,ch) = xs_rdot_acc( npw, v2(1,c), v1(1,c) )
++        CALL mp_sum( b(i,ch), intra_pool_comm )
++        b(i,ch) = SQRT( b(i,ch) )
++        rb = 1.d0/b(i,ch)
++        !$acc parallel loop present(psi, u, v1, v2)
++        DO j = 1, npwx
++           psi(j,c) = u(j,c)
++           IF (j <= npw) THEN
++              v2(j,c) = v2(j,c)*rb
++              v1(j,c) = v1(j,c)*rb
++           END IF
++           u(j,c) = v2(j,c)
++        END DO
++     END DO
++     !
++     IF (MOD(i,xcheck_conv) == 0) THEN
++        c = 1
++        DO WHILE ( c <= nact )
++           ch = col2ch(c)
++           lconv = converge(a(:,ch), b(:,ch), i, comp(:,ch), error, xemin_ry, &
++                            xemax_ry, xgamma_ry, xnepoint, xerror, terminator)
++           IF ( lconv ) THEN
++              WRITE(stdout,'(8x,a,i1,a,i6,a,f12.8)') '!   [chain ',ch,'] => CONVERGED at iter ', &
++                                                     i,' with error=',error
++              ncalcv(ch) = i
++              iconv(ch) = .true.
++              IF ( c < nact ) THEN       ! move the last active chain into column c
++                 !$acc parallel loop present(psi, u, v1, v2) private(t)
++                 DO j = 1, npwx
++                    t = psi(j,c); psi(j,c) = psi(j,nact); psi(j,nact) = t
++                    t = u(j,c);   u(j,c)   = u(j,nact);   u(j,nact)   = t
++                    t = v1(j,c);  v1(j,c)  = v1(j,nact);  v1(j,nact)  = t
++                    t = v2(j,c);  v2(j,c)  = v2(j,nact);  v2(j,nact)  = t
++                 END DO
++                 itmp = col2ch(c); col2ch(c) = col2ch(nact); col2ch(nact) = itmp
++              END IF
++              nact = nact - 1
++           ELSE
++              WRITE(stdout,'(8x,a,i1,a,i6,a,f12.8)') '|   [chain ',ch,'] Estimated error at iter ', &
++                                                     i,': ', error
++              c = c + 1
++           END IF
++        END DO
++        IF ( nact == 0 ) EXIT
++     ENDIF
++     !
++  ENDDO
++  !
++  !$acc end data
++  !$acc exit data delete(becp%k)
++  !$acc exit data delete(becp)
++  !
++  DO ch = 1, nch
++     IF (.NOT.iconv(ch)) THEN
++        WRITE(stdout,'(8x,a,i1,a,i6,a)') '!   [chain ',ch,'] XANES not converged after', i-1,&
++                                         ' iterations'
++        WRITE(stdout,'(8x,a,i6,a,l1)') '!   Estimated final error after ',&
++             i-1,'iterations: ', &
++             converge(a(:,ch),b(:,ch),i-1,comp(:,ch),error,xemin_ry,xemax_ry,&
++                      xgamma_ry,xnepoint,xerror,terminator)
++        ncalcv(ch) = i-1
++     ENDIF
++  END DO
++  !
++  DEALLOCATE( v1, v2, u, comp )
++  !
++END SUBROUTINE lanczos_uspp_acc_batch
+ #endif
+diff --git a/XSpectra/src/read_input_and_bcast.f90 b/XSpectra/src/read_input_and_bcast.f90
+index d21ed58ce..a749da1fd 100644
+--- a/XSpectra/src/read_input_and_bcast.f90
++++ b/XSpectra/src/read_input_and_bcast.f90
+@@ -47,6 +47,7 @@ subroutine read_input_and_bcast(filerecon, r_paw)
+        xiabs,&
+        xkvec,&
+        xepsilon,&
++       xepsilon_xyz,&      ! .true.: x, y and z polarizations in one run (K-edge dipole)
+        xcoordcrys,&
+        ef_r,&              ! obsolete since June 2014
+        xe0,&            ! Zero of energy for cross section plot in eV
+@@ -180,6 +181,7 @@ subroutine read_input_and_bcast(filerecon, r_paw)
+ 
+   CALL mp_bcast( xkvec,  ionode_id, world_comm )
+   CALL mp_bcast( xepsilon,  ionode_id, world_comm )
++  CALL mp_bcast( xepsilon_xyz,  ionode_id, world_comm )
+ 
+   CALL mp_bcast( xonly_plot,  ionode_id, world_comm )
+   CALL mp_bcast( filerecon,  ionode_id, world_comm )
+diff --git a/XSpectra/src/set_xspectra_namelists_defaults.f90 b/XSpectra/src/set_xspectra_namelists_defaults.f90
+index 6e9b13f50..6ebbaab0a 100644
+--- a/XSpectra/src/set_xspectra_namelists_defaults.f90
++++ b/XSpectra/src/set_xspectra_namelists_defaults.f90
+@@ -46,6 +46,7 @@ subroutine set_xspectra_namelists_defaults()
+   xkvec(2)=1.d0
+   xkvec(3)=0.d0
+   xepsilon(1)=1.d0
++  xepsilon_xyz=.false.
+   xepsilon(2:3)=0.d0
+   !ef_r=0.d0
+   xe0=xe0_default 
+diff --git a/XSpectra/src/xanes_dipole.f90 b/XSpectra/src/xanes_dipole.f90
+index 09f5e6429..b4dc1ce8c 100644
+--- a/XSpectra/src/xanes_dipole.f90
++++ b/XSpectra/src/xanes_dipole.f90
+@@ -40,7 +40,7 @@ SUBROUTINE xanes_dipole(a,b,ncalcv,xnorm,core_wfn,paw_iltonhb,&
+ 
+   USE xspectra,        ONLY : xiabs, xanes_dip, xang_mom, xniter,&
+                               xnitermax, xepsilon,time_limit,calculated,&
+-                              save_file_kind
++                              save_file_kind, n_lanczos, xepsilon_xyz
+   USE atom,            ONLY : rgrid, msh
+   USE radin_mod
+   USE basis,           ONLY : natomwfc, wfcatom, swfcatom
+@@ -55,11 +55,12 @@ SUBROUTINE xanes_dipole(a,b,ncalcv,xnorm,core_wfn,paw_iltonhb,&
+ 
+   IMPLICIT NONE
+   !
+-  REAL(dp), INTENT(INOUT) :: a(xnitermax,1,nks)
+-  REAL(dp), INTENT(INOUT) :: b(xnitermax,1,nks)     
+-  REAL(dp), INTENT(INOUT) :: xnorm(1,nks)
++  ! n_lanczos = 1, or 3 with xepsilon_xyz (chains = Cartesian x, y, z polarizations)
++  REAL(dp), INTENT(INOUT) :: a(xnitermax,n_lanczos,nks)
++  REAL(dp), INTENT(INOUT) :: b(xnitermax,n_lanczos,nks)     
++  REAL(dp), INTENT(INOUT) :: xnorm(n_lanczos,nks)
+   REAL(dp), INTENT(IN)    :: core_wfn(ndmx)
+-  INTEGER, INTENT(INOUT)  :: ncalcv(1,nks)
++  INTEGER, INTENT(INOUT)  :: ncalcv(n_lanczos,nks)
+   INTEGER, INTENT(IN)     :: paw_iltonhb(0:paw_lmaxkb,xspectra_paw_nhm,ntyp)
+   LOGICAL, INTENT(IN)     :: terminator
+   !
+@@ -73,8 +74,10 @@ SUBROUTINE xanes_dipole(a,b,ncalcv,xnorm,core_wfn,paw_iltonhb,&
+   REAL(dp) :: norm, normps
+   REAL(dp), ALLOCATABLE :: aux(:)
+   COMPLEX(dp), ALLOCATABLE :: paw_vkb_cplx(:,:)
+-  COMPLEX(dp), ALLOCATABLE :: psiwfc(:), spsiwfc(:)
++  COMPLEX(dp), ALLOCATABLE :: psiwfc(:,:), spsiwfc(:)
+   CHARACTER(LEN=4) :: verbosity
++  INTEGER  :: ich, nch            ! Lanczos chain (polarization) index, number of chains
++  REAL(dp) :: eps(3,3)            ! polarization vector of each chain
+ 
+   REAL(dp) :: timenow 
+   REAL(DP), EXTERNAL :: ddot, get_clock
+@@ -97,7 +100,17 @@ SUBROUTINE xanes_dipole(a,b,ncalcv,xnorm,core_wfn,paw_iltonhb,&
+   ALLOCATE(aux(rgrid(xiabs)%mesh)) !allocation too big, it needs only up to msh
+   ALLOCATE (paw_vkb_cplx( npwx,  paw_nkb))
+   ALLOCATE(xanes_dip(paw_recon(xiabs)%paw_nl(xang_mom)))
+-  ALLOCATE(psiwfc(npwx))
++  nch = n_lanczos
++  IF ( nch /= 1 .AND. .NOT. xepsilon_xyz ) CALL errore('xanes_dipole','n_lanczos /= 1',nch)
++  eps(:,:) = 0.d0
++  IF ( xepsilon_xyz ) THEN
++     DO ich = 1, nch
++        eps(ich,ich) = 1.d0        ! Cartesian x, y, z
++     ENDDO
++  ELSE
++     eps(:,1) = xepsilon(:)
++  ENDIF
++  ALLOCATE(psiwfc(npwx,nch))
+   xanes_dip(:)=0.d0
+ 
+   ! $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+@@ -289,7 +302,12 @@ SUBROUTINE xanes_dipole(a,b,ncalcv,xnorm,core_wfn,paw_iltonhb,&
+      !    It includes the radial matrix element, the angular matrix element,
+      !    and the associated PAW projector.
+      !
+-     psiwfc(1:npw)=(0.d0,0.d0)
++     !<CG>
++     CALL allocate_bec_type(nkb,nch,becp)
++
++     write(6,*) 'okvan=',okvan
++     DO ich = 1, nch       ! one initial vector per polarization (nch = 1 unless xepsilon_xyz)
++     psiwfc(1:npw,ich)=(0.d0,0.d0)
+      DO ip=1,paw_recon(xiabs)%paw_nl(xang_mom)   
+         ipx=ipx_0+paw_iltonhb(xang_mom,ip,xiabs)
+ 
+@@ -304,63 +322,79 @@ SUBROUTINE xanes_dipole(a,b,ncalcv,xnorm,core_wfn,paw_iltonhb,&
+         !   l, m=-l -------> Y_{l,1}-Y_{l,-1} or sin(m\phi)      2*l+1
+ 
+ 
+-        psiwfc(1:npw)=psiwfc(1:npw) + ( pref                                   &
++        psiwfc(1:npw,ich)=psiwfc(1:npw,ich) + ( pref                           &
+                                         * paw_vkb_cplx(1:npw,ipx+2)            &
+-                                        * (xepsilon(1)+(0.d0,1.d0)*xepsilon(2))&
++                                        * (eps(1,ich)+(0.d0,1.d0)*eps(2,ich))  &
+                                        +pref                                   &
+                                         * paw_vkb_cplx(1:npw,ipx+1)            &
+-                                        *(-xepsilon(1)+(0.d0,1.d0)*xepsilon(2))&
++                                        *(-eps(1,ich)+(0.d0,1.d0)*eps(2,ich))  &
+                                        +prefb                                  &
+                                         *paw_vkb_cplx(1:npw,ipx)               &
+-                                        *xepsilon(3)                           &
++                                        *eps(3,ich)                            &
+                                       )                                        &
+                                     * xanes_dip(ip)/SQRT(fpi)
+ 
+      ENDDO
+-     psiwfc(1:npw)=psiwfc(1:npw)*SQRT(fpi)/3.0
++     psiwfc(1:npw,ich)=psiwfc(1:npw,ich)*SQRT(fpi)/3.0
+ 
+      !... Normalizes the wavefunction psiwfc(1:npw)
+      !
+ 
+-     !<CG>
+-     CALL allocate_bec_type(nkb,1,becp)
+-
+-     write(6,*) 'okvan=',okvan
+      IF (okvan) THEN
+         ALLOCATE(spsiwfc(npwx))
+         spsiwfc(:)=(0.d0,0.d0)
+-        recalc=.true.
+-        CALL sm1_psi(recalc,npwx, npw, 1, psiwfc, spsiwfc)
+-        xnorm_partial=ddot(2*npw,psiwfc,1,spsiwfc,1)
++        recalc=(ich == 1)          ! BB_ is the same for all chains of this k-point
++        CALL sm1_psi(recalc,npwx, npw, 1, psiwfc(1,ich), spsiwfc)
++        xnorm_partial=ddot(2*npw,psiwfc(1,ich),1,spsiwfc,1)
+         DEALLOCATE(spsiwfc)
+      ELSE
+ !        xnorm_partial=0.d0
+ !        do ip=1,npw
+ !          xnorm_partial=xnorm_partial+conjg(psiwfc(ip))*psiwfc(ip)
+ !       enddo
+-        xnorm_partial=ddot(2*npw,psiwfc,1,psiwfc,1)
++        xnorm_partial=ddot(2*npw,psiwfc(1,ich),1,psiwfc(1,ich),1)
+ 
+      ENDIF
+      !</CG>
+ 
+      CALL mp_sum( xnorm_partial, intra_pool_comm )
+ 
+-     xnorm(1,ik)=SQRT(xnorm_partial)
++     xnorm(ich,ik)=SQRT(xnorm_partial)
++     IF (nch > 1) WRITE(stdout,'(8x,a,3f5.1,a)') '|   polarization (', eps(:,ich), ')'
+      WRITE(stdout,'(8x,a,e15.8)') '|   Norm of the initial Lanczos vector:',&
+-          xnorm(1,ik)
++          xnorm(ich,ik)
+ 
+-     norm=1.d0/xnorm(1,ik)
++     norm=1.d0/xnorm(ich,ik)
+      
+-     CALL zdscal(npw,norm,psiwfc,1)
++     CALL zdscal(npw,norm,psiwfc(1,ich),1)
++     ENDDO   ! chains
+     
+      CALL stop_clock( 'xs_kinit' )
+      !... Starts the Lanczos procedure
+      !
+      CALL start_clock( 'xs_lanczos' )
+-     IF (okvan) THEN
+-        CALL lanczos_uspp(a(:,1,ik),b(:,1,ik),npw,psiwfc,ncalcv(1,ik),terminator)
++     IF (nch == 1) THEN
++        IF (okvan) THEN
++           CALL lanczos_uspp(a(:,1,ik),b(:,1,ik),npw,psiwfc(:,1),ncalcv(1,ik),terminator)
++        ELSE
++           CALL lanczos(a(:,1,ik),b(:,1,ik),npw,psiwfc(:,1),ncalcv(1,ik),terminator)
++        ENDIF
+      ELSE
+-        CALL lanczos(a(:,1,ik),b(:,1,ik),npw,psiwfc,ncalcv(1,ik),terminator)
++#if defined(__CUDA)
++        ! GPU: all chains together (h_psi and S^-1 on nch vectors per pass over vkb)
++        IF (.NOT. okvan) CALL errore('xanes_dipole', &
++             'xepsilon_xyz on the GPU needs ultrasoft/PAW pseudopotentials', 1)
++        CALL lanczos_uspp_acc_batch(a(:,:,ik),b(:,:,ik),npw,psiwfc,ncalcv(:,ik),terminator,nch)
++#else
++        DO ich = 1, nch
++           WRITE(stdout,'(8x,a,3f5.1,a)') '|   Lanczos for polarization (', eps(:,ich), ')'
++           IF (okvan) THEN
++              CALL lanczos_uspp(a(:,ich,ik),b(:,ich,ik),npw,psiwfc(:,ich),ncalcv(ich,ik),terminator)
++           ELSE
++              CALL lanczos(a(:,ich,ik),b(:,ich,ik),npw,psiwfc(:,ich),ncalcv(ich,ik),terminator)
++           ENDIF
++        ENDDO
++#endif
+      ENDIF
+      CALL stop_clock( 'xs_lanczos' )
+ 
+@@ -389,7 +423,7 @@ SUBROUTINE xanes_dipole(a,b,ncalcv,xnorm,core_wfn,paw_iltonhb,&
+      !ENDIF
+ 
+      CALL deallocate_bec_type ( becp ) ! CG
+-     calculated(1,ik)=1  
++     calculated(:,ik)=1  
+ 
+   ENDDO  ! LOOP on k-points
+  
+diff --git a/XSpectra/src/xspectra.f90 b/XSpectra/src/xspectra.f90
+index 0baa19937..9d61b56f6 100644
+--- a/XSpectra/src/xspectra.f90
++++ b/XSpectra/src/xspectra.f90
+@@ -94,6 +94,12 @@ PROGRAM X_Spectra
+   REAL (DP) :: ehomo, elumo, middle_gap ! in eV 
+   REAL (DP) :: e_core, e_core_ryd
+   REAL (DP), ALLOCATABLE :: a(:,:,:),b(:,:,:),xnorm(:,:)      !lanczos vectors
++  ! xepsilon_xyz: results of the three polarizations, written one by one
++  REAL (DP), ALLOCATABLE :: a_xyz(:,:,:),b_xyz(:,:,:),xnorm_xyz(:,:)
++  INTEGER, ALLOCATABLE :: ncalcv_xyz(:,:)
++  INTEGER :: ipol_out, npol_out
++  CHARACTER (LEN=256) :: x_save_base, xanes_base
++  CHARACTER (LEN=1), PARAMETER :: cxyz(3) = (/ 'x', 'y', 'z' /)
+   !REAL (DP), EXTERNAL   :: efermig,efermit
+  
+   LOGICAL :: exst !, loc_set
+@@ -128,6 +134,25 @@ PROGRAM X_Spectra
+ 
+   call select_nl_init(edge, nl_init, two_edges, n_lanczos)     
+ 
++  IF ( xepsilon_xyz ) THEN
++     ! x, y and z polarizations of a K-edge (s initial state) dipole calculation in one run
++     IF ( TRIM(calculation) /= 'xanes' .OR. xang_mom /= 1 .OR. nl_init(2) /= 0 &
++          .OR. two_edges ) CALL errore('xspectra', &
++          'xepsilon_xyz is only implemented for xanes_dipole at s (K, L1, ...) edges', 1)
++     IF ( xonly_plot ) CALL errore('xspectra', 'xepsilon_xyz with xonly_plot: '// &
++          'run the plot step separately for each _x/_y/_z save file', 1)
++     IF ( TRIM(ADJUSTL(restart_mode)) == 'restart' ) CALL errore('xspectra', &
++          'xepsilon_xyz cannot restart (run the polarizations separately)', 1)
++     n_lanczos = 3
++     x_save_base = x_save_file
++     xanes_base  = xanes_file
++     WRITE(stdout,'(5x,a)') 'xepsilon_xyz: Cartesian x, y and z polarizations computed together'
++     CALL xs_pol_filename( x_save_base, 'x', x_save_file )
++     WRITE(stdout,'(5x,3a)') 'output files: ', TRIM(x_save_file), ' (and _y, _z), '
++     CALL xs_pol_filename( xanes_base, 'x', xanes_file )
++     WRITE(stdout,'(5x,3a)') '              ', TRIM(xanes_file), ' (and _y, _z)'
++  ENDIF
++
+   CALL start_clock( calculation  )
+ 
+   ! $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+@@ -340,7 +365,7 @@ PROGRAM X_Spectra
+            call xanes_dipole_general_edge(a,b,ncalcv,nl_init,xnorm,core_wfn,paw_iltonhb,terminator, verbosity)
+         ENDIF
+ 
+-        CALL write_save_file(a,b,xnorm,ncalcv,x_save_file)
++        IF ( .NOT. xepsilon_xyz ) CALL write_save_file(a,b,xnorm,ncalcv,x_save_file)
+ 
+      ELSE ! only the spectrum plot
+         WRITE(stdout,1000) ! return+line
+@@ -358,7 +383,33 @@ PROGRAM X_Spectra
+         ENDIF
+      ENDIF
+ 
++     npol_out = 1
++     IF ( xepsilon_xyz ) THEN
++        ! one standard (single-polarization) save file per polarization
++        CALL MOVE_ALLOC( a, a_xyz );         CALL MOVE_ALLOC( b, b_xyz )
++        CALL MOVE_ALLOC( xnorm, xnorm_xyz ); CALL MOVE_ALLOC( ncalcv, ncalcv_xyz )
++        n_lanczos = 1
++        ALLOCATE( a(xnitermax,1,nks), b(xnitermax,1,nks), xnorm(1,nks), ncalcv(1,nks) )
++        npol_out = 3
++        DO ipol_out = 1, npol_out
++           a(:,1,:) = a_xyz(:,ipol_out,:);   b(:,1,:) = b_xyz(:,ipol_out,:)
++           xnorm(1,:) = xnorm_xyz(ipol_out,:); ncalcv(1,:) = ncalcv_xyz(ipol_out,:)
++           xepsilon(:) = 0.d0;  xepsilon(ipol_out) = 1.d0
++           CALL xs_pol_filename( x_save_base, cxyz(ipol_out), x_save_file )
++           CALL write_save_file(a,b,xnorm,ncalcv,x_save_file)
++        ENDDO
++     ENDIF
++
+      IF (TRIM(save_file_kind).eq.'unfinished') CALL stop_xspectra ()       
++
++     DO ipol_out = 1, npol_out     ! spectrum of each polarization (1 unless xepsilon_xyz)
++     IF ( xepsilon_xyz ) THEN
++        a(:,1,:) = a_xyz(:,ipol_out,:);   b(:,1,:) = b_xyz(:,ipol_out,:)
++        xnorm(1,:) = xnorm_xyz(ipol_out,:); ncalcv(1,:) = ncalcv_xyz(ipol_out,:)
++        xepsilon(:) = 0.d0;  xepsilon(ipol_out) = 1.d0
++        CALL xs_pol_filename( xanes_base, cxyz(ipol_out), xanes_file )
++        WRITE(stdout,'(/,5x,a,a)') 'Polarization ', cxyz(ipol_out)
++     ENDIF
+  
+      IF (.NOT.xonly_plot) THEN
+         !
+@@ -408,6 +459,7 @@ PROGRAM X_Spectra
+      WRITE(stdout,'(5x,"Cross-section successfully written in ",a,/)') &
+       xanes_file
+      IF (.NOT. xonly_plot) WRITE(stdout,'(5x,"... End STEP 2 ...",/)')
++     ENDDO   ! ipol_out
+ 
+   ELSEIF(TRIM(calculation).EQ.'rxes') THEN
+      CALL errore( 'Main', 'rxes Not yet implemented',1)
+@@ -760,3 +812,20 @@ SUBROUTINE initialize_gamma_tab
+   ENDDO
+ 
+ END SUBROUTINE initialize_gamma_tab
++
++!------------------------------------------------------------------------------
++SUBROUTINE xs_pol_filename( base, c, fname )
++  !----------------------------------------------------------------------------
++  !! base 'xanes.dat' -> 'xanes_x.dat'; without an extension: 'xanes' -> 'xanes_x'
++  IMPLICIT NONE
++  CHARACTER(LEN=*), INTENT(IN)  :: base, c
++  CHARACTER(LEN=*), INTENT(OUT) :: fname
++  INTEGER :: idot, islash
++  idot   = INDEX( base, '.', BACK=.TRUE. )
++  islash = INDEX( base, '/', BACK=.TRUE. )
++  IF ( idot > islash + 1 ) THEN
++     fname = base(1:idot-1) // '_' // TRIM(c) // TRIM(base(idot:))
++  ELSE
++     fname = TRIM(base) // '_' // TRIM(c)
++  ENDIF
++END SUBROUTINE xs_pol_filename
+diff --git a/XSpectra/src/xspectra_mod.f90 b/XSpectra/src/xspectra_mod.f90
+index 793ff4021..22ccc42d3 100644
+--- a/XSpectra/src/xspectra_mod.f90
++++ b/XSpectra/src/xspectra_mod.f90
+@@ -46,6 +46,10 @@ module xspectra
+ 
+    logical :: terminator, show_status
+ 
++   logical :: xepsilon_xyz   ! K-edge dipole: compute the Cartesian x, y and z polarizations
++                             ! in one run (one setup, batched Lanczos on the GPU); output files
++                             ! get _x/_y/_z inserted before the extension of x_save_file/xanes_file
++
+    logical :: lplus,      &         ! if true only the l+1 transition is calculated
+               lminus, &              ! if true only the l-1 transition is calculated
+               two_edges
+-- 
+2.43.5
+

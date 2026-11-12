@@ -1,0 +1,132 @@
+From a59fd918a61cb22852b32df9d7452d0a44fd7981 Mon Sep 17 00:00:00 2001
+From: ynwang <ynwang@iis.u-tokyo.ac.jp>
+Date: Wed, 11 Nov 2026 15:59:07 +0900
+Subject: [PATCH 7/9] XSpectra GPU: build the S^-1 matrix BB_ on the device,
+ once per k-point
+
+The k-point matrix B = vkb^H vkb (nkb x nkb x npw; 1836x1836x68000 for
+the 162-atom SiO2 cell, ~1.8 TFLOP) was computed on the host, and the
+identical matrix was rebuilt twice per k-point (normalisation in
+xanes_* and the first S^-1 call in lanczos_uspp): ~800 s of the 1040 s
+of one polarization on one RTX PRO 5000 GPU. GPU build only:
+- B with cuBLAS (MYZGEMM) on the device copy of vkb, copied back for the
+  unchanged host Q-products and inversion; BB_ mirrored on the device
+- a rebuild for the same k-point (current_k) and npw is skipped
+- clocks sm1_bb_gemm, sm1_bb_inv
+CPU build: unchanged. Small test: phase-2 criteria PASS (x, y, z).
+---
+ XSpectra/src/lr_sm1_psi.f90 | 44 ++++++++++++++++++++++++++++++++-----
+ XSpectra/src/xspectra.f90   |  2 ++
+ 2 files changed, 40 insertions(+), 6 deletions(-)
+
+diff --git a/XSpectra/src/lr_sm1_psi.f90 b/XSpectra/src/lr_sm1_psi.f90
+index bbff536db..052dd69fc 100644
+--- a/XSpectra/src/lr_sm1_psi.f90
++++ b/XSpectra/src/lr_sm1_psi.f90
+@@ -19,6 +19,14 @@ MODULE xs_sm1_data
+   IMPLICIT NONE
+   COMPLEX(DP), ALLOCATABLE :: BB_(:,:)
+   INTEGER :: bb_version = 0     ! incremented each time BB_ is rebuilt
++#if defined(__CUDA)
++  ! GPU build: BB_ depends only on the k-point (through vkb). The original
++  ! code rebuilds the identical matrix for every recalc=.true. request (twice
++  ! per k-point: normalisation in xanes_* and the first call in lanczos_uspp);
++  ! here a rebuild for the same k-point and npw is skipped.
++  INTEGER :: bb_k = -1, bb_n = -1
++  LOGICAL :: bb_on_device = .FALSE.
++#endif
+ CONTAINS
+   !--------------------------------------------------------------------------
+   SUBROUTINE sm1_build_bb_k( n, lda )
+@@ -28,16 +36,37 @@ CONTAINS
+     USE ions_base,  ONLY : nat, ntyp => nsp, ityp
+     USE mp,         ONLY : mp_sum
+     USE mp_pools,   ONLY : intra_pool_comm
++#if defined(__CUDA)
++    USE wvfct,      ONLY : current_k
++#endif
+     IMPLICIT NONE
+     INTEGER, INTENT(IN) :: n, lda
+     INTEGER :: ikb, jkb, ih, jh, na, nt, ijkb0, ii
+     COMPLEX(DP), ALLOCATABLE :: ps(:,:)
+     !
++#if defined(__CUDA)
++    IF ( current_k == bb_k .AND. n == bb_n ) RETURN   ! same k-point: BB_ unchanged
++#endif
+     call errore('sm1_psi','recalculating BB_ matrix',-1)
+ 
+     ALLOCATE( ps( nkb, nkb ) )    
+ 
++    CALL start_clock( 'sm1_bb_gemm' )
++#if defined(__CUDA)
++    ! GPU build: B = vkb^H vkb (nkb x nkb x npw, the dominant cost) with cuBLAS
++    ! on the device copy of vkb (init_us_2 keeps host and device vkb equal)
++    IF ( .NOT. bb_on_device ) THEN
++       !$acc enter data create(BB_)
++       bb_on_device = .TRUE.
++    END IF
++    !$acc host_data use_device(vkb, BB_)
++    CALL MYZGEMM('C','N',nkb,nkb,n,(1.d0,0.d0),vkb,lda,vkb,lda,(0.d0,0.d0),BB_,nkb)
++    !$acc end host_data
++    !$acc update self(BB_)
++#else
+     call zgemm('C','N',nkb,nkb,n,(1.d0,0.d0),vkb,lda,vkb,lda,(0.d0,0.d0),BB_(1,1),nkb)
++#endif
++    CALL stop_clock( 'sm1_bb_gemm' )
+     !******          CALL reduce( 2 * nkb * nkb, BB_ )
+     CALL mp_sum(  BB_, intra_pool_comm ) !CG
+ 
+@@ -70,7 +99,9 @@ CONTAINS
+        ps(ii,ii) = ps(ii,ii) + (1.d0,0.d0)
+     enddo
+ 
++    CALL start_clock( 'sm1_bb_inv' )
+     call zinv_matrix(ps,nkb)
++    CALL stop_clock( 'sm1_bb_inv' )
+     BB_(:,:) = (0.d0,0.d0)
+     ijkb0 = 0
+     do nt=1,ntyp
+@@ -98,6 +129,11 @@ CONTAINS
+     enddo
+     deallocate(ps)
+     bb_version = bb_version + 1
++#if defined(__CUDA)
++    !$acc update device(BB_)
++    bb_k = current_k
++    bb_n = n
++#endif
+     !
+   END SUBROUTINE sm1_build_bb_k
+   !
+@@ -546,13 +582,9 @@ SUBROUTINE sm1_psi_acc( recalc, lda, n, m, psi, spsi )
+      ALLOCATE( BB_(nkb,nkb) )
+      recalc = .true.
+   END IF
+-  IF ( recalc ) CALL sm1_build_bb_k( n, lda )     ! host vkb is up to date (init_us_2)
++  IF ( recalc ) CALL sm1_build_bb_k( n, lda )     ! builds BB_ and mirrors it on the device
+   IF ( bb_version_dev /= bb_version ) THEN
+-     IF ( bb_version_dev < 0 ) THEN
+-        !$acc enter data copyin(BB_)
+-     ELSE
+-        !$acc update device(BB_)
+-     END IF
++     !$acc update device(BB_)
+      bb_version_dev = bb_version
+   END IF
+   !
+diff --git a/XSpectra/src/xspectra.f90 b/XSpectra/src/xspectra.f90
+index 245d0d192..5bbc7d670 100644
+--- a/XSpectra/src/xspectra.f90
++++ b/XSpectra/src/xspectra.f90
+@@ -437,6 +437,8 @@ PROGRAM X_Spectra
+   CALL print_clock( 'h_psi:calbec' )
+   CALL print_clock( 'add_vuspsi' )
+   CALL print_clock( 'sm1' )
++  CALL print_clock( 'sm1_bb_gemm' )
++  CALL print_clock( 'sm1_bb_inv' )
+   CALL print_clock( 'xs_converge' )
+   CALL print_clock( 'xs_plot' )
+ 
+-- 
+2.43.5
+

@@ -1,0 +1,124 @@
+From 3bb9e3bb470ec43768d36fd2d40772e2794ffed4 Mon Sep 17 00:00:00 2001
+From: ynwang <ynwang@iis.u-tokyo.ac.jp>
+Date: Wed, 11 Nov 2026 15:50:48 +0900
+Subject: [PATCH 6/9] XSpectra: breakdown clocks (setup, k-init, Lanczos,
+ converge, plot) for profiling
+
+New clocks xs_setup, xs_kinit, xs_lanczos, xs_converge, xs_plot and a
+printed breakdown (with h_psi, vloc_psi, h_psi:calbec, add_vuspsi, sm1,
+init_us_2, init_run) after the total. Timing only, no arithmetic change.
+---
+ XSpectra/src/lanczos.f90      |  2 ++
+ XSpectra/src/xanes_dipole.f90 |  4 ++++
+ XSpectra/src/xspectra.f90     | 18 ++++++++++++++++++
+ 3 files changed, 24 insertions(+)
+
+diff --git a/XSpectra/src/lanczos.f90 b/XSpectra/src/lanczos.f90
+index 94d7281b1..1e46e36ab 100644
+--- a/XSpectra/src/lanczos.f90
++++ b/XSpectra/src/lanczos.f90
+@@ -407,6 +407,7 @@ LOGICAL FUNCTION converge(a,b,m,comp,estimated_error,xemin,xemax,xgamma,&
+   INTEGER  :: n
+   LOGICAL :: use_term
+   !
++  CALL start_clock( 'xs_converge' )
+   deltae = (xemax-xemin) / xnepoint
+   err = 0.d0
+   area = 0.d0
+@@ -426,6 +427,7 @@ LOGICAL FUNCTION converge(a,b,m,comp,estimated_error,xemin,xemax,xgamma,&
+   ELSE
+      converge = .false.
+   ENDIF
++  CALL stop_clock( 'xs_converge' )
+ END FUNCTION converge
+  
+ !------------------------------------------------------------------------------
+diff --git a/XSpectra/src/xanes_dipole.f90 b/XSpectra/src/xanes_dipole.f90
+index 03a6d0721..09f5e6429 100644
+--- a/XSpectra/src/xanes_dipole.f90
++++ b/XSpectra/src/xanes_dipole.f90
+@@ -206,6 +206,7 @@ SUBROUTINE xanes_dipole(a,b,ncalcv,xnorm,core_wfn,paw_iltonhb,&
+        WRITE(stdout,'(8x,"|   Total cpu time spent up to now: ",F9.2," s")')&
+              timenow 
+ 
++     CALL start_clock( 'xs_kinit' )
+      current_k=ik 
+      IF(lsda) current_spin=isk(ik)
+      CALL g2_kin (ik)
+@@ -352,13 +353,16 @@ SUBROUTINE xanes_dipole(a,b,ncalcv,xnorm,core_wfn,paw_iltonhb,&
+      
+      CALL zdscal(npw,norm,psiwfc,1)
+     
++     CALL stop_clock( 'xs_kinit' )
+      !... Starts the Lanczos procedure
+      !
++     CALL start_clock( 'xs_lanczos' )
+      IF (okvan) THEN
+         CALL lanczos_uspp(a(:,1,ik),b(:,1,ik),npw,psiwfc,ncalcv(1,ik),terminator)
+      ELSE
+         CALL lanczos(a(:,1,ik),b(:,1,ik),npw,psiwfc,ncalcv(1,ik),terminator)
+      ENDIF
++     CALL stop_clock( 'xs_lanczos' )
+ 
+      !!      Then I write small report of the lanczos results
+      !!
+diff --git a/XSpectra/src/xspectra.f90 b/XSpectra/src/xspectra.f90
+index 8230c2d1a..245d0d192 100644
+--- a/XSpectra/src/xspectra.f90
++++ b/XSpectra/src/xspectra.f90
+@@ -142,6 +142,7 @@ PROGRAM X_Spectra
+      '                 Reading SCF save directory: ',trim(prefix)//'.save'
+      WRITE(stdout,1001) ! line+return
+ 
++     CALL start_clock( 'xs_setup' )
+      CALL read_file()
+ 
+      CALL calculate_and_write_homo_lumo_to_stdout(ehomo,elumo)
+@@ -298,6 +299,7 @@ PROGRAM X_Spectra
+   ! for restart
+   ALLOCATE(calculated(n_lanczos,nks))
+   calculated(:,:)=0
++  IF(.NOT.xonly_plot) CALL stop_clock( 'xs_setup' )
+ 
+   ! $$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+   ! $  And now we go...  XANES CALCULATION
+@@ -385,6 +387,7 @@ PROGRAM X_Spectra
+ 
+      call write_report_cut_occ_states(cut_occ_states, e_core)
+      
++     CALL start_clock( 'xs_plot' )
+      IF(xang_mom.EQ.1) THEN
+         CALL plot_xanes_dipole(a,b,xnorm,ncalcv,terminator,e_core_ryd,1)
+         if(two_edges) CALL plot_xanes_dipole(a,b,xnorm,ncalcv,terminator,e_core_ryd,2)
+@@ -393,6 +396,7 @@ PROGRAM X_Spectra
+      ELSEIF(nl_init(2).eq.1) then
+         
+      ENDIF
++     CALL stop_clock( 'xs_plot' )
+      !
+      WRITE(stdout,'(5x,"Cross-section successfully written in ",a,/)') &
+       xanes_file
+@@ -421,6 +425,20 @@ PROGRAM X_Spectra
+ 
+   CALL stop_clock( calculation  )
+   CALL print_clock( calculation )
++  ! breakdown (clocks that were never started are not printed)
++  CALL print_clock( 'xs_setup' )
++  CALL print_clock( 'init_run' )
++  CALL print_clock( 'xanes_dipole' )
++  CALL print_clock( 'xs_kinit' )
++  CALL print_clock( 'init_us_2' )
++  CALL print_clock( 'xs_lanczos' )
++  CALL print_clock( 'h_psi' )
++  CALL print_clock( 'vloc_psi' )
++  CALL print_clock( 'h_psi:calbec' )
++  CALL print_clock( 'add_vuspsi' )
++  CALL print_clock( 'sm1' )
++  CALL print_clock( 'xs_converge' )
++  CALL print_clock( 'xs_plot' )
+ 
+ #if defined (__ENVIRON)
+   IF (use_environ) CALL print_environ_clocks()
+-- 
+2.43.5
+
