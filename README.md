@@ -96,9 +96,9 @@ projector products fall onto slow FP64 tensor-core GEMM kernels. Run the polariz
 
 ## Benchmark: system size, edges, materials and molecules
 
-The benchmark below compares one GPU (RTX PRO 5000 Blackwell) with a 64-core CPU node on the same jobs.
-The 162-atom SiO₂ case, the L₁ edge, multi-GPU runs and other GPU models are still running and will be
-added later.
+The benchmark below compares one GPU (RTX PRO 5000 Blackwell) with a 64-core CPU node on the same jobs,
+and then multi-GPU runs and other GPU models on the 162-atom SiO₂ cell. The L₁ and L₂ edges of the 162-atom
+SiO₂ cell are still running and will be added later.
 
 **Common settings**
 - **Method**: XCH core hole with pslibrary 1.0.0 PAW datasets and an absorber dataset generated with `ld1.x`;
@@ -121,7 +121,7 @@ added later.
 <img src="docs/img/benchmark_size_speedup_sio2.png" width="400" alt="CPU/GPU speed-up vs number of atoms, SiO2 Si K edge">
 </p>
 
-**System size (α-SiO₂ supercells, Si K edge, 9 to 72 atoms)** — speed-up = CPU time / GPU time.
+**System size (α-SiO₂ supercells, Si K edge, 9 to 162 atoms)** — speed-up = CPU time / GPU time.
 - **Circles, "XSpectra only"**: XSpectra alone, one polarization.
 - **Squares, "CPU SCF + XSpectra (x, y, z)"**: the whole workflow, i.e. CPU SCF plus the x, y and z spectra,
   with the SCF on the CPU in both cases.
@@ -132,11 +132,14 @@ How the speed-up changes with size:
   the GPU is slower.
 - **Break-even**: around 40 atoms.
 - **72 atoms**: the GPU is 2.0× faster for XSpectra alone and 1.8× faster for the whole workflow.
-- **Cost per Lanczos step**: per k point it grows from 0.56 ms (9 atoms) to 3.3 ms (72 atoms) on the GPU,
-  and from 0.06 ms to 7.3 ms on the CPU.
+- **162 atoms** (36 k points): XSpectra takes 8,225 s per polarization on the CPU node and 2,317 s on the GPU
+  (3.6×). With the 1,827 s CPU SCF, the x, y, z calculation takes 7.3 h on the CPU node and 2.4 h with
+  XSpectra on the GPU (3.0×). The GPU uses 10.0 GiB of device memory.
+- **Cost per Lanczos step**: per k point it grows from 0.56 ms (9 atoms) to 10.6 ms (162 atoms) on the GPU,
+  and from 0.06 ms to 38.4 ms on the CPU.
 
 <p align="center">
-<img src="docs/img/benchmark_time_solids.png" width="400" alt="CPU vs GPU time, Si, AlN and Al2O3, K and L2 edges">
+<img src="docs/img/benchmark_time_solids.png" width="400" alt="CPU vs GPU time, Si, AlN, Al2O3 and 162-atom SiO2">
 <img src="docs/img/benchmark_time_molecules.png" width="400" alt="CPU vs GPU time, C K edge of molecules">
 </p>
 
@@ -152,16 +155,14 @@ How the speed-up changes with size:
 | Si (diamond) | 64 | 64 | K / L₂ | 3.1 / 1.6\* | 2.8 / 1.5\* | 6.1 GiB |
 | w-AlN | 108 | 75 | K / L₂ | 2.0\* / 2.9 | 1.9\* / 2.8 | 6.1 GiB |
 | α-Al₂O₃ | 120 | 75 | K / L₂ | 1.6\* / 2.9 | 1.6\* / 2.9 | 6.1 GiB |
+| α-SiO₂ | 162 | 36 | Si K | 3.6 | 3.0 | 10.0 GiB |
 | CH₄, H₂CO, CF₃C≡CH (each C) | 4–7 | Γ | C K | 1.2–1.7 | 1.2–1.6 | 4.2–4.4 GiB |
 
 \* **Two CPU node types**: the CPU runs used two node types with the same core count.
 - **Unstarred entries**: 2 × Xeon Gold 6530.
 - **Starred entries**: 2 × Xeon Gold 6538Y+.
-- **Effect on the speed-up**: XSpectra is limited by memory bandwidth, and the 6538Y+ node was 1.5–2× faster
-  per Lanczos step. Starred speed-ups are therefore lower; compare speed-ups only between entries of the
-  same kind.
-- **Evidence**: the GPU time per step is the same for the K and L₂ edges of a material (Si 4.65 / 4.69 ms,
-  AlN 5.53 / 5.58 ms per k point and step).
+- **Effect on the speed-up**: XSpectra runs faster on the 6538Y+ node, so starred speed-ups are lower;
+  compare speed-ups only between entries of the same kind.
 
 **Correctness (GPU vs CPU, same SCF data)**: in all cases above:
 - the broadened spectra (Gaussian 0.2 eV × Lorentzian 0.1 eV, −3 to 40 eV) agree to ≤ 8e-5 of the maximum;
@@ -172,19 +173,42 @@ There, the chains start to differ after about 42 iterations: in a molecule the f
 early, and loss of orthogonality then amplifies rounding errors. The same divergence appears between two
 CPU runs with 16 and 64 MPI ranks, so it is not caused by the GPU.
 
+### Several GPUs and other GPU models (162-atom SiO₂, Si K edge)
+
+<p align="center">
+<img src="docs/img/benchmark_multigpu_pro6000.png" width="400" alt="Speed-up on 1, 2 and 3 RTX PRO 6000 GPUs">
+<img src="docs/img/benchmark_gpu_models.png" width="400" alt="XSpectra time on RTX PRO 5000, RTX PRO 6000 Max-Q and RTX 6000 Ada">
+</p>
+
+**Several GPUs (left)**: k-point pools (`-nk` = number of GPUs) with one MPI rank per GPU, on RTX PRO 6000
+Blackwell Max-Q cards. The 36 k points split evenly over 2 or 3 GPUs, and the scaling is almost ideal.
+
+**Other GPU models (right)**: one GPU each; the dashed line is the 64-core CPU node. The labels give the
+memory bandwidth and the FP64 peak (NVIDIA figures; FP64 = FP32/64). The cards are ordered by memory
+bandwidth, not by FP64 peak: the RTX 6000 Ada has a higher FP64 peak than the RTX PRO 5000 but is 1.3× slower.
+
+| GPUs | time per polarization | speed-up vs CPU node | SCF + XSpectra speed-up | GPU memory (peak, per card) |
+|---|---|---|---|---|
+| 1 × RTX PRO 5000 Blackwell | 2,317 s | 3.6 | 3.0 | 10.0 GiB |
+| 1 × RTX 6000 Ada | 3,106 s | 2.6 | 2.4 | 10.1 GiB |
+| 1 × RTX PRO 6000 Blackwell Max-Q | 2,196 s | 3.7 | 3.1 | 10.5 GiB |
+| 2 × RTX PRO 6000 Blackwell Max-Q | 1,109 s (1.98× vs 1 GPU) | 7.4 | 5.1 | 7.6 GiB |
+| 3 × RTX PRO 6000 Blackwell Max-Q | 748 s (2.94× vs 1 GPU) | 11.0 | 6.5 | 6.6 GiB |
+
+All GPU runs agree with the CPU run to ≤ 1.1e-10 (a, b, first 50 iterations) and ≤ 2.2e-6 (spectrum).
+
 ## Limitations
 
 - **Tested environment**: NVIDIA HPC SDK 26.3 (CUDA 13.1). GPUs: RTX PRO 5000/6000 Blackwell and
   A100; the A100 had driver 550 and used the SDK's CUDA forward-compatibility library. CPU reference
   builds: NVHPC and Intel oneAPI 2023.2 + MKL.
 - **Validated cases**:
-  - K-edge dipole: on the 162-atom SiO₂ cell shown above, on SiO₂ supercells of 9–72 atoms, on Si, AlN
+  - K-edge dipole: on SiO₂ supercells of 9–162 atoms, on Si, AlN
     and Al₂O₃, and on the C K edge of molecules (see the benchmark section);
   - L₂ edge: on Si, AlN and Al₂O₃ (64–120 atoms);
   - L₁ edge: on a 9-atom test cell;
   - K-edge quadrupole and the L₃ edge: on the 9-atom test cell only;
-  - k-point pools (`-nk`) and several MPI ranks sharing one GPU: tested.
-- **Not tested yet**: runs on several GPUs (in progress).
+  - k-point pools (`-nk`), several MPI ranks sharing one GPU, and 2–3 GPUs with one rank per GPU: tested.
 - **Stops with an error on the GPU**: norm-conserving pseudopotentials, `gamma_only`, noncollinear
   calculations, and `xepsilon_xyz` together with `restart`/`xonly_plot`.
 - **Reproducibility**: Lanczos without reorthogonalization amplifies rounding differences. GPU and CPU
