@@ -1,12 +1,20 @@
 # XSpectra on the GPU (OpenACC) — patches for dm_qe
 
-GPU port of Quantum ESPRESSO's `xspectra.x`: X-ray absorption, K edge, dipole and quadrupole, and the
-L₃ edge, with ultrasoft/PAW pseudopotentials. It runs on top of
+GPU port of Quantum ESPRESSO's `xspectra.x`: X-ray absorption with ultrasoft/PAW pseudopotentials, covering the
+K edge (dipole and quadrupole) and the L₁, L₂ and L₃ edges. It runs on top of
 [Discovered Materials' GPU fork of Quantum ESPRESSO (dm_qe)](https://github.com/discovered-materials/dm_qe).
 
 This repository contains **only our changes**, as `git format-patch` patches, together with the build
-and run scripts, the analysis tools and the validation and timing results. The base code is not
+and run scripts, the analysis tools and the validation and benchmark results. The base code is not
 included: get it from the dm_qe repository and apply the patches.
+
+**Highlights**
+- **Validation**: the GPU results agree with the CPU code to the level at which CPU runs with different MPI
+  layouts agree with each other. This was checked on solids and molecules.
+- **Speed**: for a 162-atom α-SiO₂ supercell (Si K edge), one RTX PRO 5000 workstation GPU runs XSpectra
+  3.6× faster than a 64-core Xeon node. The whole calculation, with the SCF on the CPU, is 3.0× faster
+  (7.3 h → 2.4 h).
+- **Several GPUs**: k-point pools scale almost ideally (2.94× on 3 GPUs).
 
 ## Applying the patches
 
@@ -44,61 +52,55 @@ and the host target option for GPU hosts without AVX-512.
 The CPU build gives bit-identical results before and after these patches (checked with Intel/MKL),
 except for the timing printout.
 
+## Recommended workflow: SCF on the CPU, XSpectra on the GPU
+
+- **Where to run each step**: run the SCF (`pw.x`) on a CPU node and XSpectra on the GPU.
+  - The GPU `xspectra.x` reads the save directory written by a CPU `pw.x` directly. This was checked with
+    Intel/MKL-built CPU runs.
+  - On RTX workstation cards the SCF is slower on the GPU than on a 64-core CPU node, because it is limited by
+    the cards' low FP64 throughput (162-atom SiO₂, 8 k points: 3,208 s on one RTX PRO 5000 vs 1,862 s on the
+    CPU node).
+  - XSpectra's Lanczos recursion is limited by memory bandwidth instead, so it benefits from the GPU.
+- **When the GPU pays off**: for cells of more than about 40 atoms. In smaller cells with dense k-point grids,
+  a CPU node that runs many k points in parallel is faster. See the system-size figure in the benchmark
+  section below.
+- **Several GPUs**: use k-point pools, `mpirun -np N xspectra.x -nk N`, with one rank per GPU.
+- **Polarizations**: run x, y and z as separate jobs. `xepsilon_xyz` is correct, but on these cards it is
+  slower than three separate runs, because the 3-column projector products fall onto slow FP64 tensor-core
+  GEMM kernels.
+- **Iteration count**: if the spectrum is broadened afterwards (e.g. Gaussian 0.2 eV × Lorentzian 0.1 eV),
+  2,000 Lanczos iterations per k point already give the converged result within 1e-5 up to 40 eV above E_F.
+
 ## Validation
 
-- **Criterion**: GPU results must lie within the spread of CPU runs that differ only in the number of
-  MPI ranks and in the compiler (NVHPC and Intel). CPU runs are not bitwise reproducible, because
-  FFTW_MEASURE chooses its algorithm by timing. The checks are:
-  - Lanczos a, b over the first 50 iterations agree to ≤ 1e-10;
-  - spectrum difference ≤ the largest CPU–CPU difference;
-  - iteration counts agree to ±10 %.
-  
-  Script: `tools/ensemble_check.py`.
-- **162-atom SiO₂ cell**: GPU vs CPU reading the same SCF data gives
-  first 50 iterations ≤ 5e-12 and a spectrum difference ≤ 1.2e-3 of the maximum.
+- **Criterion**: the GPU results must lie within the spread of CPU runs that differ only in the number of
+  MPI ranks and in the compiler (NVHPC and Intel). Lanczos without reorthogonalization amplifies rounding
+  differences, so runs are compared with three measures:
+  - the Lanczos coefficients a, b over the first 50 iterations (agreement of about 1e-10 or better);
+  - the broadened spectrum;
+  - the iteration counts (±10 %).
+
+  Script: `tools/ensemble_check.py`. Development checks were run on a 9-atom cell, for the dipole and quadrupole
+  K edge and the L₃ edge, with k-point pools and with several ranks sharing one GPU.
+- **Benchmark cases**: all cases in the benchmark below were compared with the CPU code reading the same SCF
+  data (see the correctness notes there).
 
 <p align="center"><img src="docs/img/spectrum_cpu_vs_gpu_sio2_162.png" width="420" alt="Si K-edge spectrum of 162-atom SiO2, QE CPU vs QE GPU"></p>
 
-The figure shows the Si K edge of 162-atom SiO₂ (x polarization, Lanczos run to convergence), from the
-same SCF save and the same code: CPU (64 cores, open circles) and GPU (one RTX PRO 5000, line). Both are
-broadened in the same way (Gaussian exp(−(E/0.2)²) × Lorentzian HWHM 0.1 eV), and the intensities are
-not normalized. The largest difference between −3 and 40 eV is 3.5e-6 of the peak height.
-Script: `tools/plot_cpu_vs_gpu_spectrum.py`.
-
-## Recommended workflow: SCF on the CPU, XSpectra on the GPU
-
-![Wall time of SCF + XSpectra, 162-atom SiO2](docs/img/timing_sio2_162.png)
-
-The fastest way to run is to do the SCF (`pw.x`) on a CPU node and XSpectra on the GPU. The save
-directory written by a CPU `pw.x` can be read directly by the GPU `xspectra.x`; this was checked with
-Intel/MKL- and NVHPC-built CPU runs. On RTX workstation cards the SCF is slower on the GPU than on a
-64-core CPU node, because it is limited by the cards' low FP64 throughput. XSpectra's Lanczos recursion
-is limited by memory bandwidth, so it runs 3.5× faster on one GPU.
-
-## Timing (162-atom SiO₂, Si K edge, XCH, one polarization, wall time)
-
-| | QE CPU (64 cores, Xeon Gold 6530) | QE GPU (1× RTX PRO 5000 Blackwell) |
-|---|---|---|
-| SCF (`pw.x`) | 1,862 s | 3,208 s |
-| XSpectra, Lanczos to convergence | 1,658 s | **477 s (3.5× faster)** |
-| SCF on CPU + XSpectra on GPU | — | **2,339 s total (1.5× faster than CPU only)** |
-
-- **Setup**: ENCUT 600 eV, Γ-centred 2×2×2 k-points, 8 k-points × 68,000 plane waves, 1,836 PAW
-  projectors.
-- **CPU runs**: `-nk 8`, Intel oneAPI + MKL.
-- **Lanczos**: `xniter = 8000`, `xerror = 1e-3`, `xgamma = 0.05 eV`. All k-points converge in
-  4,900–5,800 iterations; the CPU and GPU spectra agree to 5.6e-4 of the maximum.
-- **Iteration count**: for spectra that are broadened afterwards (here Gaussian 0.2 eV × Lorentzian
-  0.1 eV), 2,000 iterations already give the same result within 1e-5 up to 40 eV above E_F.
-
-`xepsilon_xyz` is correct, but on these cards it is slower than three separate runs: the 3-column
-projector products fall onto slow FP64 tensor-core GEMM kernels. Run the polarizations separately.
+The figure shows the Si K edge of 162-atom α-SiO₂ (average of x, y and z, 36 k points, Lanczos run to
+convergence), computed from the same SCF data on the CPU (64 cores, open circles) and on the GPU (one RTX PRO
+5000, line).
+- **Broadening**: both spectra are broadened in the same way, with a Gaussian exp(−(E/0.2)²) and a Lorentzian of
+  HWHM 0.1 eV. The intensities are not normalized.
+- **Agreement**: the largest difference between −3 and 40 eV is 1.1e-6 of the peak height, and the Lanczos
+  coefficients of the first 50 iterations agree to 1.1e-10.
+- **Script**: `tools/plot_cpu_vs_gpu_spectrum.py`.
 
 ## Benchmark: system size, edges, materials and molecules
 
-The benchmark below compares one GPU (RTX PRO 5000 Blackwell) with a 64-core CPU node on the same jobs,
-and then multi-GPU runs and other GPU models on the 162-atom SiO₂ cell. The L₁ and L₂ edges of the 162-atom
-SiO₂ cell are still running and will be added later.
+The benchmark compares one GPU (RTX PRO 5000 Blackwell) with a 64-core CPU node on the same jobs. It then looks
+at multi-GPU runs and other GPU models on the 162-atom SiO₂ cell. The L₁ and L₂ edges of the 162-atom SiO₂ cell
+are still running and will be added later.
 
 **Common settings**
 - **Method**: XCH core hole with pslibrary 1.0.0 PAW datasets and an absorber dataset generated with `ld1.x`;
@@ -115,13 +117,13 @@ SiO₂ cell are still running and will be added later.
   process, so the whole card is reserved.
 - **CPU**: 64 MPI ranks with k-point pools, Intel oneAPI + MKL.
 
-**Correctness**: in every case the GPU result agrees with the CPU result (details below the figures).
+### System size (α-SiO₂ supercells, Si K edge, 9 to 162 atoms)
 
 <p align="center">
 <img src="docs/img/benchmark_size_speedup_sio2.png" width="400" alt="CPU/GPU speed-up vs number of atoms, SiO2 Si K edge">
 </p>
 
-**System size (α-SiO₂ supercells, Si K edge, 9 to 162 atoms)** — speed-up = CPU time / GPU time.
+Speed-up = CPU time / GPU time.
 - **Circles, "XSpectra only"**: XSpectra alone, one polarization.
 - **Squares, "CPU SCF + XSpectra (x, y, z)"**: the whole workflow, i.e. CPU SCF plus the x, y and z spectra,
   with the SCF on the CPU in both cases.
@@ -138,12 +140,14 @@ How the speed-up changes with size:
 - **Cost per Lanczos step**: per k point it grows from 0.56 ms (9 atoms) to 10.6 ms (162 atoms) on the GPU,
   and from 0.06 ms to 38.4 ms on the CPU.
 
+### Materials and molecules
+
 <p align="center">
 <img src="docs/img/benchmark_time_solids.png" width="400" alt="CPU vs GPU time, Si, AlN, Al2O3 and 162-atom SiO2">
 <img src="docs/img/benchmark_time_molecules.png" width="400" alt="CPU vs GPU time, C K edge of molecules">
 </p>
 
-**Materials (left) and molecules (right).** Each case has two bars: CPU on the left, GPU on the right.
+**Solids (left) and molecules (right).** Each case has two bars: CPU on the left, GPU on the right.
 - **Bars**: the grey part is the CPU SCF; red/blue is the time for the x, y and z spectra on the CPU/GPU.
 - **Numbers above each pair**: the upper one is the speed-up of XSpectra alone; the lower one is the speed-up
   of SCF + XSpectra.
@@ -199,16 +203,16 @@ All GPU runs agree with the CPU run to ≤ 1.1e-10 (a, b, first 50 iterations) a
 
 ## Limitations
 
-- **Tested environment**: NVIDIA HPC SDK 26.3 (CUDA 13.1). GPUs: RTX PRO 5000/6000 Blackwell and
-  A100; the A100 had driver 550 and used the SDK's CUDA forward-compatibility library. CPU reference
+- **Tested environment**: NVIDIA HPC SDK 26.3 (CUDA 13.1). GPUs: RTX PRO 5000/6000 Blackwell, RTX 6000
+  Ada and A100; the A100 had driver 550 and used the SDK's CUDA forward-compatibility library. CPU reference
   builds: NVHPC and Intel oneAPI 2023.2 + MKL.
 - **Validated cases**:
-  - K-edge dipole: on SiO₂ supercells of 9–162 atoms, on Si, AlN
-    and Al₂O₃, and on the C K edge of molecules (see the benchmark section);
+  - K-edge dipole: on SiO₂ supercells of 9–162 atoms, on Si, AlN and Al₂O₃, and on the C K edge of
+    molecules (see the benchmark section);
   - L₂ edge: on Si, AlN and Al₂O₃ (64–120 atoms);
   - L₁ edge: on a 9-atom test cell;
   - K-edge quadrupole and the L₃ edge: on the 9-atom test cell only;
-  - k-point pools (`-nk`), several MPI ranks sharing one GPU, and 2–3 GPUs with one rank per GPU: tested.
+  - k-point pools (`-nk`), several MPI ranks sharing one GPU, and 2–3 GPUs with one rank per GPU.
 - **Stops with an error on the GPU**: norm-conserving pseudopotentials, `gamma_only`, noncollinear
   calculations, and `xepsilon_xyz` together with `restart`/`xonly_plot`.
 - **Reproducibility**: Lanczos without reorthogonalization amplifies rounding differences. GPU and CPU
