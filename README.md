@@ -99,8 +99,7 @@ convergence), computed from the same SCF data on the CPU (64 cores, open circles
 ## Benchmark: system size, edges, materials and molecules
 
 The benchmark compares one GPU (RTX PRO 5000 Blackwell) with a 64-core CPU node on the same jobs. It then looks
-at multi-GPU runs and other GPU models on the 162-atom SiO₂ cell. The L₁ and L₂ edges of the 162-atom SiO₂ cell
-are still running and will be added later.
+at multi-GPU runs and other GPU models on the 162-atom SiO₂ cell, and at the Si L₁ and L₂ edges of the same cell.
 
 **Common settings**
 - **Method**: XCH core hole with pslibrary 1.0.0 PAW datasets and an absorber dataset generated with `ld1.x`;
@@ -159,7 +158,7 @@ How the speed-up changes with size:
 | Si (diamond) | 64 | 64 | K / L₂ | 3.1 / 1.6\* | 2.8 / 1.5\* | 6.1 GiB |
 | w-AlN | 108 | 75 | K / L₂ | 2.0\* / 2.9 | 1.9\* / 2.8 | 6.1 GiB |
 | α-Al₂O₃ | 120 | 75 | K / L₂ | 1.6\* / 2.9 | 1.6\* / 2.9 | 6.1 GiB |
-| α-SiO₂ | 162 | 36 | Si K | 3.6 | 3.0 | 10.0 GiB |
+| α-SiO₂ | 162 | 36 | Si K / L₁ / L₂ | 3.6 / 3.5 / 3.5 | 3.0 / 3.3 / 3.3 | 10.0–10.3 GiB |
 | CH₄, H₂CO, CF₃C≡CH (each C) | 4–7 | Γ | C K | 1.2–1.7 | 1.2–1.6 | 4.2–4.4 GiB |
 
 \* **Two CPU node types**: the CPU runs used two node types with the same core count.
@@ -209,8 +208,8 @@ All GPU runs agree with the CPU run to ≤ 1.1e-10 (a, b, first 50 iterations) a
 - **Validated cases**:
   - K-edge dipole: on SiO₂ supercells of 9–162 atoms, on Si, AlN and Al₂O₃, and on the C K edge of
     molecules (see the benchmark section);
-  - L₂ edge: on Si, AlN and Al₂O₃ (64–120 atoms);
-  - L₁ edge: on a 9-atom test cell;
+  - L₂ edge: on Si, AlN, Al₂O₃ and 162-atom SiO₂ (64–162 atoms);
+  - L₁ edge: on 162-atom SiO₂ and a 9-atom test cell;
   - K-edge quadrupole and the L₃ edge: on the 9-atom test cell only;
   - k-point pools (`-nk`), several MPI ranks sharing one GPU, and 2–3 GPUs with one rank per GPU.
 - **Stops with an error on the GPU**: norm-conserving pseudopotentials, `gamma_only`, noncollinear
