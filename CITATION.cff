@@ -1,7 +1,7 @@
 cff-version: 1.2.0
-message: "If you use this software, please cite it as below, together with Quantum ESPRESSO and XSpectra (see README)."
+message: "If you use this software, please cite the preprint below, together with Quantum ESPRESSO and XSpectra (see README)."
 title: "XSpectra on the GPU (OpenACC) — patches for dm_qe"
-abstract: "GPU (OpenACC) port of Quantum ESPRESSO's XSpectra (K-edge dipole/quadrupole and L3 edge, ultrasoft/PAW) as patches on Discovered Materials' GPU fork of Quantum ESPRESSO (dm_qe)."
+abstract: "GPU (OpenACC) port of Quantum ESPRESSO's XSpectra (K-edge dipole/quadrupole and L1, L2, L3 edges, ultrasoft/PAW) as patches on Discovered Materials' GPU fork of Quantum ESPRESSO (dm_qe)."
 authors:
   - family-names: "Wang"
     given-names: "Yinan"
@@ -19,6 +19,20 @@ keywords:
   - ELNES
   - GPU
   - OpenACC
+preferred-citation:
+  type: article
+  title: "GPU acceleration of first-principles X-ray absorption spectra: an OpenACC port of XSpectra in Quantum ESPRESSO"
+  authors:
+    - family-names: "Wang"
+      given-names: "Yinan"
+      orcid: "https://orcid.org/0009-0008-8642-6753"
+    - family-names: "Mizoguchi"
+      given-names: "Teruyasu"
+  journal: "ChemRxiv"
+  doi: "10.26434/chemrxiv.15012423/v1"
+  url: "https://doi.org/10.26434/chemrxiv.15012423/v1"
+  year: 2026
+  month: 11
 references:
   - type: software
     title: "dm_qe: Discovered Materials' GPU fork of Quantum ESPRESSO"

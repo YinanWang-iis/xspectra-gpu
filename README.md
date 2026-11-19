@@ -8,6 +8,10 @@ This repository contains **only our changes**, as `git format-patch` patches, to
 and run scripts, the analysis tools and the validation and benchmark results. The base code is not
 included: get it from the dm_qe repository and apply the patches.
 
+**Preprint**: the implementation and the benchmark are described in detail in our ChemRxiv preprint,
+Y. Wang and T. Mizoguchi, *GPU acceleration of first-principles X-ray absorption spectra: an OpenACC port of
+XSpectra in Quantum ESPRESSO*, ChemRxiv (2026), [doi:10.26434/chemrxiv.15012423/v1](https://doi.org/10.26434/chemrxiv.15012423/v1).
+
 **Highlights**
 - **Validation**: the GPU results agree with the CPU code to the level at which CPU runs with different MPI
   layouts agree with each other. This was checked on solids and molecules.
@@ -238,21 +242,39 @@ The pseudopotentials are not included: the Si and O PAW datasets are pslibrary 1
 
 ## How to cite
 
-GitHub shows a "Cite this repository" button generated from `CITATION.cff`. If you use this work in
-a publication or presentation, please cite:
+If you use this work in a publication or presentation, please cite the preprint (item 1) and the
+codes it builds on. GitHub's "Cite this repository" button (generated from `CITATION.cff`) gives the
+preprint as the preferred citation.
 
-1. **This repository**: Y. Wang (ORCID [0009-0008-8642-6753](https://orcid.org/0009-0008-8642-6753)), *XSpectra on the GPU (OpenACC) — patches for dm_qe*,
+1. **The preprint** describing this work: Y. Wang and T. Mizoguchi, *GPU acceleration of first-principles
+   X-ray absorption spectra: an OpenACC port of XSpectra in Quantum ESPRESSO*, ChemRxiv (2026),
+   [doi:10.26434/chemrxiv.15012423/v1](https://doi.org/10.26434/chemrxiv.15012423/v1).
+2. **This repository**: Y. Wang (ORCID [0009-0008-8642-6753](https://orcid.org/0009-0008-8642-6753)), *XSpectra on the GPU (OpenACC) — patches for dm_qe*,
    https://github.com/YinanWang-iis/xspectra-gpu (2026).
-2. **Quantum ESPRESSO**, as its developers ask (https://www.quantum-espresso.org/quote):
+3. **Quantum ESPRESSO**, as its developers ask (https://www.quantum-espresso.org/quote):
    - P. Giannozzi et al., J. Phys.: Condens. Matter **21**, 395502 (2009);
    - P. Giannozzi et al., J. Phys.: Condens. Matter **29**, 465901 (2017);
    - P. Giannozzi et al., J. Chem. Phys. **152**, 154105 (2020).
-3. **XSpectra**, as printed by the program:
+4. **XSpectra**, as printed by the program:
    - M. Taillefumier, D. Cabaret, A. M. Flank, and F. Mauri, Phys. Rev. B **66**, 195107 (2002);
    - Ch. Gougoussis, M. Calandra, A. P. Seitsonen, and F. Mauri, Phys. Rev. B **80**, 075102 (2009);
    - O. Bunau and M. Calandra, Phys. Rev. B **87**, 205105 (2013).
-4. **dm_qe**, the GPU fork this work is built on: link to
+5. **dm_qe**, the GPU fork this work is built on: link to
    https://github.com/discovered-materials/dm_qe, as its authors ask.
+
+BibTeX for the preprint:
+
+```bibtex
+@article{Wang2026XSpectraGPU,
+  author  = {Wang, Yinan and Mizoguchi, Teruyasu},
+  title   = {{GPU} acceleration of first-principles {X}-ray absorption spectra: an {OpenACC} port of
+             {XSpectra} in {Quantum ESPRESSO}},
+  journal = {ChemRxiv},
+  year    = {2026},
+  doi     = {10.26434/chemrxiv.15012423/v1},
+  url     = {https://doi.org/10.26434/chemrxiv.15012423/v1}
+}
+```
 
 ## License and credit
 
